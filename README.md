@@ -99,11 +99,11 @@ The package vendors three UBI scripts unmodified. Drop in newer iterations
 of those scripts by overwriting the corresponding file inside `ubi_toolkit/` —
 the CLI dispatcher auto-uses whatever is there.
 
-| Module         | Purpose                          |
-|----------------|----------------------------------|
-| `analyst`      | UBI region detection + extract   |
-| `repacker`     | Surgical volume replacement      |
-| `ecc_runtime`  | NAND ECC layout handling         |
+| Module         | Source                              |
+|----------------|-------------------------------------|
+| `analyst`      | `ubi_analyst.py`                    |
+| `repacker`     | `clean_ubi_surgical_repacker.py`    |
+| `ecc_runtime`  | `ecc_runtime_progressive.py`        |
 
 ## Iteration Discipline
 
