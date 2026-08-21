@@ -114,4 +114,5 @@ is the hard boundary — don't refactor across versions.
 
 ## License
 
-All Rights Reserved. See `LICENSE` for terms.
+Standard copyright notice, © 2026 Bharatiy, "All Rights Reserved".
+See `LICENSE` for full terms.
