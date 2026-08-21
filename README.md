@@ -88,9 +88,9 @@ ubi_toolkit/
 └── ubi_toolkit/           # installable package
     ├── __init__.py        # version, OPERATIONS, METADATA_FILENAME
     ├── ubipack.py         # unified CLI dispatcher
-    ├── analyst.py         # vendored UBI analyst
-    ├── repacker.py        # vendored surgical repacker
-    └── ecc_runtime.py     # vendored ECC runtime
+    ├── analyst.py         # UBI region detection + extract
+    ├── repacker.py        # Surgical volume replacement
+    └── ecc_runtime.py     # NAND ECC layout handling
 ```
 
 ## Submodules
@@ -114,4 +114,4 @@ is the hard boundary — don't refactor across versions.
 
 ## License
 
-Proprietary — all rights reserved.
+All Rights Reserved. See `LICENSE` for terms.
