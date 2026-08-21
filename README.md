@@ -1,28 +1,32 @@
 # ubipack — UBI Firmware Analysis & Surgical Repacking Toolkit
 
-A unified CLI that wraps the UBI analyst + surgical repacker scripts under
-`~/Scripts/UBI/` into a single installable command. Mirrors the `sqpack`
-architecture: top-level launcher + Python package + `pyproject.toml`
-console-script entry point.
+A unified CLI that wraps the UBI analyst + surgical repacker scripts into
+a single installable command. Mirrors the `sqpack` architecture: top-level
+launcher + Python package + `pyproject.toml` console-script entry point.
 
 ## Install
 
+Run from inside the project directory (the folder containing this README):
+
 ```bash
 # Option A — uv (recommended; isolated tool venv)
-uv tool install /home/bharatiy/Scripts/ubi_toolkit_v1.0
+uv tool install .
 
 # Option B — pipx
-pipx install /home/bharatiy/Scripts/ubi_toolkit_v1.0
+pipx install .
 
 # Option C — pip in a venv
 python3 -m venv .venv && . .venv/bin/activate
-pip install -e /home/bharatiy/Scripts/ubi_toolkit_v1.0
-
-# No-install quickstart: run the top-level launcher directly
-python3 /home/bharatiy/Scripts/ubi_toolkit_v1.0/ubipack.py --help
+pip install -e .
 ```
 
-After `uv tool install` (or `pipx install`), the `ubipack` command is on
+No-install quickstart — run the top-level launcher directly:
+
+```bash
+python3 ubipack.py --help
+```
+
+After `uv tool install .` (or `pipx install .`), the `ubipack` command is on
 `PATH` system-wide via `~/.local/bin/ubipack`.
 
 ## Operations
@@ -73,37 +77,10 @@ ubipack -V -n analysis_out/
 ubipack -t
 ```
 
-## Sidecar Metadata
-
-Every `analyze`/`extract` run writes a `.ubipack_meta.json` next to the
-analysis directory capturing the source firmware path, sha256, detected
-geometry, and region count. This sidecar lets a later `repack` or `verify`
-invocation auto-detect provenance without re-prompting.
-
-Schema version 1:
-
-```json
-{
-  "schema_version": 1,
-  "source_image": "/abs/path/firmware.bin",
-  "source_sha256": "abc123…",
-  "ubipack_version": "1.0.0",
-  "operation": "analyze",
-  "region_count": 2,
-  "geometry": {
-    "page_size": 2048,
-    "oob_size": 64,
-    "peb_size": 131072,
-    "leb_size": null,
-    "mode": "auto"
-  }
-}
-```
-
 ## Project Layout
 
 ```
-ubi_toolkit_v1.0/
+ubi_toolkit/
 ├── .gitignore             # Python build/cache outputs
 ├── pyproject.toml         # setuptools, ubipack console-script entry
 ├── README.md              # this file
@@ -111,23 +88,22 @@ ubi_toolkit_v1.0/
 └── ubi_toolkit/           # installable package
     ├── __init__.py        # version, OPERATIONS, METADATA_FILENAME
     ├── ubipack.py         # unified CLI dispatcher
-    ├── analyst.py         # ubi_analyst_mod-OpenWUI_upg-06.py (vendored)
-    ├── repacker.py        # clean_ubi_surgical_repacker_itr04.py (vendored)
-    └── ecc_runtime.py     # ecc_runtime_progressive.py (vendored)
+    ├── analyst.py         # vendored UBI analyst
+    ├── repacker.py        # vendored surgical repacker
+    └── ecc_runtime.py     # vendored ECC runtime
 ```
 
 ## Submodules
 
-The package vendors three of the most recent scripts from `~/Scripts/UBI/`
-unmodified. New iterations of those scripts drop in by overwriting the
-corresponding file inside `ubi_toolkit/` — the CLI dispatcher auto-uses
-whatever is there.
+The package vendors three UBI scripts unmodified. Drop in newer iterations
+of those scripts by overwriting the corresponding file inside `ubi_toolkit/` —
+the CLI dispatcher auto-uses whatever is there.
 
-| Module         | Source                                            |
-|----------------|---------------------------------------------------|
-| `analyst`      | `ubi_analyst_mod-OpenWUI_upg-06.py`               |
-| `repacker`     | `clean_ubi_surgical_repacker_itr04.py`            |
-| `ecc_runtime`  | `ecc_runtime_progressive.py`                      |
+| Module         | Purpose                          |
+|----------------|----------------------------------|
+| `analyst`      | UBI region detection + extract   |
+| `repacker`     | Surgical volume replacement      |
+| `ecc_runtime`  | NAND ECC layout handling         |
 
 ## Iteration Discipline
 
@@ -138,4 +114,4 @@ is the hard boundary — don't refactor across versions.
 
 ## License
 
-Unlicense — public domain.
+Proprietary — all rights reserved.
