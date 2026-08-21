@@ -202,8 +202,8 @@ class UBIRegion:
 
 @dataclass
 class FirmwareHeader:
-    """Represents a firmware wrapper header found before UBI data (e.g. TP-Link upgrade package, U-Boot image)."""
-    header_type: str          # 'tplink_upg', 'u_boot_legacy', 'none'
+    """Represents a firmware wrapper header found before UBI data (e.g. a size-prefixed upgrade package, a legacy bootloader image)."""
+    header_type: str          # 'be_size_upg', 'u_boot_legacy', 'none'
     header_size: int          # byte offset where actual UBI/flash data starts
     raw_header: Optional[bytes] = None  # raw header bytes (for extraction)
     meta: dict = field(default_factory=dict)
@@ -1181,17 +1181,17 @@ class FirmwareHeaderDetector:
     """Detects firmware wrapper headers that sit before UBI/flash data.
 
     Two known types so far:
-      1. TP-Link upgrade package — first 4 bytes (BE) = total file size,
-         followed by a metadata string like 'fw-type:Cloud'.
+      1. Big-endian size-prefixed upgrade package — first 4 bytes (BE) = total
+         file size, followed by a metadata string like 'fw-type:Cloud'.
          UBI data starts at an offset specified within the header structure.
-      2. U-Boot legacy image — magic 0x27051956, 64-byte header with image
+      2. Legacy bootloader image — magic 0x27051956, 64-byte header with image
          name, load address, entry point, etc. May be followed by bootloader
          and factory/calibration data before UBI.
     """
 
     U_BOOT_MAGIC = 0x27051956
-    TP_LINK_UPG_MIN_HEADER = 16       # minimum recognizable header size
-    TP_LINK_UPG_MAX_HEADER = 0x20000  # maximum header region to search (128 KB)
+    BE_SIZE_UPG_MIN_HEADER = 16       # minimum recognizable header size
+    BE_SIZE_UPG_MAX_HEADER = 0x20000  # maximum header region to search (128 KB)
     U_BOOT_HEADER_SIZE = 64
 
     @staticmethod
@@ -1199,15 +1199,15 @@ class FirmwareHeaderDetector:
         if len(data) < 16:
             return FirmwareHeader(header_type='none', header_size=0)
 
-        # --- Check U-Boot legacy image header ---
+        # --- Check legacy bootloader image header ---
         magic_ub = struct.unpack_from('>I', data, 0)[0]
         if magic_ub == FirmwareHeaderDetector.U_BOOT_MAGIC:
             return FirmwareHeaderDetector._parse_u_boot(data)
 
-        # --- Check TP-Link upgrade package header ---
+        # --- Check big-endian size-prefixed upgrade package header ---
         fw_size_be = struct.unpack_from('>I', data, 0)[0]
         if fw_size_be == len(data):
-            return FirmwareHeaderDetector._parse_tplink_upg(data)
+            return FirmwareHeaderDetector._parse_be_size_upg(data)
 
         return FirmwareHeader(header_type='none', header_size=0)
 
@@ -1246,8 +1246,8 @@ class FirmwareHeaderDetector:
         )
 
     @staticmethod
-    def _parse_tplink_upg(data: bytes) -> FirmwareHeader:
-        """Parse TP-Link upgrade package header.
+    def _parse_be_size_upg(data: bytes) -> FirmwareHeader:
+        """Parse big-endian size-prefixed upgrade package header.
 
         Structure:
           Offset 0: 4-byte BE uint32 = total file size
@@ -1288,10 +1288,10 @@ class FirmwareHeaderDetector:
             ubi_offset = 0  # no header detected, treat entire file as data
 
         raw_header = data[:ubi_offset] if ubi_offset > 0 else None
-        log.info("Detected TP-Link upgrade package header: fw-type='%s', UBI at 0x%X",
+        log.info("Detected BE size-prefixed upgrade package header: fw-type='%s', UBI at 0x%X",
                  meta.get('fw_type', '?'), ubi_offset)
         return FirmwareHeader(
-            header_type='tplink_upg', header_size=ubi_offset,
+            header_type='be_size_upg', header_size=ubi_offset,
             raw_header=raw_header, meta=meta
         )
 
@@ -1312,7 +1312,7 @@ class FirmwareAnalyst:
         raw_data = self.firmware_path.read_bytes()
         md5, sha256 = hashlib.md5(raw_data).hexdigest(), hashlib.sha256(raw_data).hexdigest()
 
-        # --- Detect firmware wrapper header (TP-Link upgrade package, U-Boot, etc.) ---
+        # --- Detect firmware wrapper header (BE size-prefixed upgrade package, legacy bootloader, etc.) ---
         fw_header = FirmwareHeaderDetector.detect(raw_data)
         if fw_header.header_type != 'none' and fw_header.header_size > 0:
             log.info("Firmware header: type='%s', header_size=%d (0x%X) — skipping to UBI data",
