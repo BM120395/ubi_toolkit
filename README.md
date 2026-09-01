@@ -4,6 +4,33 @@ A unified CLI that wraps the UBI analyst + surgical repacker scripts into
 a single installable command. Mirrors the `sqpack` architecture: top-level
 launcher + Python package + `pyproject.toml` console-script entry point.
 
+## Dependencies
+
+The core `ubipack` CLI runs on the **Python standard library only** — no
+required third-party packages.
+
+| Dependency | Required? | Used for | Install command |
+|---|---|---|---|
+| Python 3.8+ | ✅ required | runtime | system Python |
+| `tkinter` | ⚪ optional | GUI (file picker / dialogs in analyst) | `sudo apt install python3-tk` (Debian/Ubuntu) |
+| `tqdm` | ⚪ optional | progress bars during long scans | `uv tool install --with tqdm .` or `pip install tqdm` |
+
+Both optional modules are **guarded** — if absent, the tool falls back to a
+no-GUI / no-progress mode and everything else works normally. Install them
+only if you want the GUI or progress bars:
+
+```sh
+# uv — with both optional extras
+uv tool install --with tqdm ./
+
+# pip
+pip install .[tqdm]
+
+# tkinter (system package, Python 3.x)
+sudo apt install python3-tk   # Debian / Ubuntu
+# macOS ships with Tk bundled; Windows includes it by default
+```
+
 ## Install
 
 Run from inside the project directory (the folder containing this README):

@@ -12,6 +12,10 @@ license = { text = "All Rights Reserved" }
 authors = [{ name = "Bharatiy" }]
 keywords = ["ubi", "ubifs", "firmware", "nand", "flash", "reverse-engineering", "embedded"]
 
+[project.optional-dependencies]
+# Optional progress bar — the CLI works without it (graceful fallback).
+tqdm = ["tqdm"]
+
 [project.scripts]
 ubipack = "ubi_toolkit.ubipack:main"
 
