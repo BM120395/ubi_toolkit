@@ -61,14 +61,37 @@ uv tool install --with tqdm ./ubi_toolkit_v1.0   # + progress bars
 ### Option B — `pipx install`
 
 ```bash
-pipx install .
+# from the toolkit directory
+pipx install ./ubi_toolkit_v1.0
+
+# or from anywhere, pointing at the directory
+pipx install /path/to/ubi_toolkit_v1.0
+
+# or straight from the built wheel
+pipx install ./dist/ubi_toolkit-1.0.0-py3-none-any.whl
 ```
+
+Optional extras after install: `pipx inject ubipack tqdm` (progress bars).
 
 ### Option C — `pip` in a venv
 
 ```bash
 python3 -m venv .venv && . .venv/bin/activate
+
+# from inside the toolkit directory
+pip install .
+
+# or from anywhere, pointing at the directory
+pip install /path/to/ubi_toolkit_v1.0
+
+# or straight from the built wheel
+pip install ./dist/ubi_toolkit-1.0.0-py3-none-any.whl
+
+# editable install (live code changes, run from the toolkit directory)
 pip install -e .
+
+# with optional extras
+pip install .[tqdm]
 ```
 
 ### Option D — install from the prebuilt distribution files
