@@ -33,28 +33,68 @@ sudo apt install python3-tk   # Debian / Ubuntu
 
 ## Install
 
-Run from inside the project directory (the folder containing this README):
+There are four ways to use it. Pick one.
+
+### Option A — `uv tool install` (recommended, isolated)
+
+Installs `ubipack` as a standalone command in its own virtual environment
+(the same way this tool is installed on the author's machine):
 
 ```bash
-# Option A — uv (recommended; isolated tool venv)
-uv tool install .
+# from the toolkit directory
+uv tool install ./ubi_toolkit_v1.0
 
-# Option B — pipx
+# or from anywhere, pointing at the directory
+uv tool install /path/to/ubi_toolkit_v1.0
+
+# or straight from the built wheel
+uv tool install ./dist/ubi_toolkit-1.0.0-py3-none-any.whl
+```
+
+After install, `ubipack` is on `PATH` (via `~/.local/bin/ubipack`).
+Include optional extras at install time:
+
+```bash
+uv tool install --with tqdm ./ubi_toolkit_v1.0   # + progress bars
+```
+
+### Option B — `pipx install`
+
+```bash
 pipx install .
+```
 
-# Option C — pip in a venv
+### Option C — `pip` in a venv
+
+```bash
 python3 -m venv .venv && . .venv/bin/activate
 pip install -e .
 ```
 
-No-install quickstart — run the top-level launcher directly:
+### Option D — install from the prebuilt distribution files
+
+`dist/` contains both packaging formats, built from this exact tree:
+
+```bash
+uv tool install ./dist/ubi_toolkit-1.0.0-py3-none-any.whl   # wheel
+pip install ./dist/ubi_toolkit-1.0.0-py3-none-any.whl
+pip install ./dist/ubi_toolkit-1.0.0.tar.gz                 # sdist
+```
+
+### No-install quickstart
+
+Run the top-level launcher directly (no install needed):
 
 ```bash
 python3 ubipack.py --help
 ```
 
-After `uv tool install .` (or `pipx install .`), the `ubipack` command is on
-`PATH` system-wide via `~/.local/bin/ubipack`.
+### Verifying the install
+
+```bash
+ubipack --version      # → 1.0.0
+ubipack -t             # toolchain + submodule sanity check
+```
 
 ## Operations
 
