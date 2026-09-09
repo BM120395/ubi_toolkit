@@ -32,6 +32,7 @@ import struct
 import subprocess
 import sys
 import time
+import zlib
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -147,6 +148,8 @@ class VIDHeaderInfo:
     sqnum: int
     hdr_crc: int
     offset_raw: Optional[int] = None
+    crc_ok: Optional[bool] = None      # gen2: result of VIDHeader._verify (None = not checked)
+    crc_conv: Optional[str] = None     # gen2: which CRC convention matched
 
 
 @dataclass
@@ -477,9 +480,99 @@ class OOBDetector:
             log.info("Auto-detected geometry: page=%dB, OOB=%dB", page_size, oob_size)
             return self._build_geometry(page_size, oob_size, raw_eb)
 
-        page_size, oob_size = self._measure_stride(candidates)
+        gen2 = self._disambiguate_geometry_gen2(candidates, f1)
+        if gen2 is not None:
+            page_size, oob_size = gen2
+        else:
+            # gen2 found no decisive evidence — fall back to legacy heuristic
+            page_size, oob_size = self._measure_stride(candidates)
+            log.info("Gen2 disambiguation inconclusive — legacy _measure_stride used")
         log.info("Disambiguated geometry: page=%dB, OOB=%dB", page_size, oob_size)
         return self._build_geometry(page_size, oob_size, raw_eb)
+
+    def _disambiguate_geometry_gen2(self, candidates: list, first_ec_off: int) -> Optional[Tuple[int, int]]:
+        """Gen2 content-evidence geometry disambiguation (additive — legacy
+        _measure_stride is untouched and remains the fallback).
+
+        EVERY candidate geometry is scored independently on its own stripped
+        window (16 raw EBs from the first EC header). Same-ratio candidates
+        are NOT equivalent — (512,16) removes 16B after every 512B while
+        (2048,64) removes 64B after every 2048B, producing different clean
+        bytes — so each candidate gets its own evidence score:
+
+          1. fs_magic hits at the EC-declared data offset (strongest)
+          2. volume-table record names parsed from the VTBL volume
+          3. EC header CRC validity (crc32 / vendor ~crc32, auto-voted)
+          4. EC headers on clean PEB boundaries + VIDs at vid_hdr_offset
+
+        Score tuple: (fs_hits, vtbl_names, ec_crc, ec_hits, vid_hits).
+        Full ties resolve to the smaller page size (v1.0 legacy default).
+        """
+        try:
+            first_ec = ECHeader.parse(self.data, first_ec_off, 0)
+        except Exception:
+            first_ec = None
+        vhf = first_ec.vid_hdr_offset if first_ec else 0x800
+        doff = first_ec.data_offset if first_ec else 0x1000
+
+        WINDOW_EBS = 16
+        fs_magics = [m for m, _, _, _, _ in FS_SCAN_SIGNATURES]
+        scored = []
+        for page_size, oob_size, stride, pages, clean_eb in candidates:
+            raw_eb = stride * pages
+            win_raw = self.data[first_ec_off: first_ec_off + WINDOW_EBS * raw_eb]
+            win_clean = bytearray()
+            pos = 0
+            while pos + page_size <= len(win_raw):
+                win_clean.extend(win_raw[pos:pos + page_size])
+                pos += stride
+            win_clean = bytes(win_clean)
+            n_eb = len(win_clean) // clean_eb
+            ec_hits = vid_hits = ec_crc = fs_hits = vtbl_names = 0
+            votes: Dict[str, int] = {}
+            for k in range(n_eb):
+                base = k * clean_eb
+                if win_clean[base:base+4] != UBI_EC_MAGIC:
+                    continue
+                ec_hits += 1
+                ok, c = ECHeader._verify(win_clean, base)
+                if ok:
+                    ec_crc += 1
+                    key = c.split("@")[0]
+                    votes[key] = votes.get(key, 0) + 1
+                vbase = base + vhf
+                if vbase + 12 <= len(win_clean) and win_clean[vbase:vbase+4] == UBI_VID_MAGIC \
+                        and win_clean[vbase+8:vbase+12] == struct.pack(">I", VolumeTable.VTBL_VOL_ID):
+                    dchunk = win_clean[base+doff: base+doff+clean_eb-doff]
+                    vtbl_names += len(VolumeTable.parse(dchunk))
+                    continue
+                if vbase + 4 <= len(win_clean) and win_clean[vbase:vbase+4] == UBI_VID_MAGIC:
+                    vid_hits += 1
+                dbase = base + doff
+                for m in fs_magics:
+                    if win_clean[dbase:dbase+len(m)] == m:
+                        fs_hits += 1
+                        break
+            conv = max(votes.items(), key=lambda kv: kv[1])[0] if votes else None
+            score = (fs_hits, vtbl_names, ec_crc, ec_hits, vid_hits)
+            scored.append((score, page_size, oob_size))
+            log.info("Gen2 geometry candidate page=%d oob=%d: fs_magics=%d "
+                     "vtbl_names=%d ec_crc_ok=%d/%d ec_boundary=%d vid=%d%s",
+                     page_size, oob_size, fs_hits, vtbl_names, ec_crc, ec_hits,
+                     ec_hits, vid_hits, f" crc_conv={conv}" if conv else "")
+        if not scored:
+            return None
+        scored.sort(key=lambda t: t[0], reverse=True)
+        best_score, best_page, best_oob = scored[0]
+        if best_score == (0, 0, 0, 0, 0):
+            log.info("Gen2: no candidate scored structural evidence")
+            return None
+        tied = [s for s in scored if s[0] == best_score]
+        if len(tied) > 1:
+            log.info("Gen2: %d candidates tie at %s — preferring smallest page "
+                     "(v1.0 legacy default)", len(tied), best_score)
+            best_page, best_oob = tied[0][1], tied[0][2]
+        return best_page, best_oob
 
     def _measure_stride(self, candidates: list) -> Tuple[int, int]:
         try:
@@ -565,6 +658,27 @@ class ECHeader:
                                 hdr_crc=struct.unpack_from(">I", data, offset+60)[0])
         except struct.error: return None
 
+    @staticmethod
+    def _verify(data: bytes, offset: int) -> Tuple[bool, str]:
+        """Verify an EC header's CRC. Accepts the plain crc32 (Linux), the
+        vendor-inverted ~crc32 (e.g. Cudy/BCM), or a 60-byte coverage variant.
+        Returns (ok, convention) — pure additive validator, never raises."""
+        try:
+            stored = struct.unpack_from(">I", data, offset+60)[0]
+        except struct.error:
+            return False, "short"
+        if stored == 0xFFFFFFFF or stored == 0x00000000:
+            return False, "blank"
+        cov = 60
+        # Some vendors (Cudy/BCM) XOR-out the CRC word; also cover variant lengths
+        for coverage in (60, 64):
+            if coverage > len(data) - offset: continue
+            base = zlib.crc32(data[offset:offset+coverage]) & 0xFFFFFFFF
+            for name, c in (("crc32", base), ("~crc32", ~base & 0xFFFFFFFF)):
+                if c == stored:
+                    return True, f"{name}@len{coverage}"
+        return False, "no-match"
+
 class VIDHeader:
     SIZE = 64
     @staticmethod
@@ -581,6 +695,78 @@ class VIDHeader:
                                  sqnum=struct.unpack_from(">Q", data, offset+0x28)[0],
                                  hdr_crc=struct.unpack_from(">I", data, offset+60)[0])
         except struct.error: return None
+
+    @staticmethod
+    def parse_be72(data: bytes, offset: int, peb_index: int) -> Optional["VIDHeaderInfo"]:
+        """Linux-standard 72-byte ubi_vid_hdr layout (additive variant):
+
+            magic(4) ver(1) vol_type(1) copy(1) compat(1)
+            vol_id(4)@+8   lnum(4)@+12      leb_ver(4)@+16  data_size(4)@+20
+            used_ebs(4)@+24 data_pad(4)@+28 data_crc(4)@+32
+            reserved(12)@+36..47  sqnum(8)@+48 (0x30)  reserved(12)@+56..67
+            hdr_crc(4)@+68 (0x44), CRC over bytes [0:68)
+
+        The legacy 64-byte 'parse' above stays the primary path untouched;
+        this variant is used by the gen2 consensus scanner when the legacy
+        layout fails sanity checks.
+        """
+        if data[offset:offset+4] != UBI_VID_MAGIC: return None
+        try:
+            return VIDHeaderInfo(offset=offset, peb_index=peb_index, version=data[offset+4],
+                                 vol_type=data[offset+5], copy_flag=data[offset+6], compat=data[offset+7],
+                                 vol_id=struct.unpack_from(">I", data, offset+8)[0],
+                                 lnum=struct.unpack_from(">I", data, offset+12)[0],
+                                 data_size=struct.unpack_from(">I", data, offset+20)[0],
+                                 used_ebs=struct.unpack_from(">I", data, offset+24)[0],
+                                 data_pad=struct.unpack_from(">I", data, offset+28)[0],
+                                 sqnum=struct.unpack_from(">Q", data, offset+0x30)[0],
+                                 hdr_crc=struct.unpack_from(">I", data, offset+68)[0])
+        except struct.error: return None
+
+    @staticmethod
+    def parse_vendor16(data: bytes, offset: int, peb_index: int) -> Optional["VIDHeaderInfo"]:
+        """Vendor-compact layout seen on some raw NAND dumps (additive):
+
+        64-byte header where lnum is a BE16 at +14 and +12..13 carry flags
+        (observed values 0x0000/0x0002/0x8000-ish on vendor images). All
+        other fields as in the legacy layout. Additive — used only by the
+        gen2 consensus scanner when it scores better than the standard
+        BE32@+12 layout.
+        """
+        if data[offset:offset+4] != UBI_VID_MAGIC: return None
+        try:
+            info = VIDHeader.parse(data, offset, peb_index)
+            if info is None: return None
+            info.lnum = struct.unpack_from(">H", data, offset+14)[0]
+            return info
+        except struct.error: return None
+
+    # Known VID parse layouts for the gen2 consensus scanner (additive).
+    # (name, parser, crc_verify) — tried in order; consensus picks the winner.
+    LAYOUTS = (
+        ("std64", None),      # legacy parse() — lnum BE32@+12, crc@+60
+        ("linux72", None),    # parse_be72()       — lnum BE32@+12, sqnum@+0x30, crc@+68
+        ("vendor16", None),   # parse_vendor16()   — lnum BE16@+14
+    )
+
+    @staticmethod
+    def _verify(data: bytes, offset: int) -> Tuple[bool, str]:
+        """Verify a VID header CRC. Tries the 64-byte coverage (matching the
+        64-byte parse) as primary, then 68/72-byte Linux ubi_vid_hdr coverage,
+        accepting plain crc32 and vendor-inverted ~crc32. Pure additive."""
+        try:
+            stored = struct.unpack_from(">I", data, offset+60)[0]
+        except struct.error:
+            return False, "short"
+        if stored == 0xFFFFFFFF or stored == 0x00000000:
+            return False, "blank"
+        for coverage in (60, 64, 68, 72):
+            if coverage > len(data) - offset: continue
+            base = zlib.crc32(data[offset:offset+coverage]) & 0xFFFFFFFF
+            for name, c in (("crc32", base), ("~crc32", ~base & 0xFFFFFFFF)):
+                if c == stored:
+                    return True, f"{name}@len{coverage}"
+        return False, "no-match"
 
 class VolumeTable:
     VTBL_VOL_ID = 0x7FFFEFFF
@@ -606,12 +792,20 @@ class UBIScanner:
         self.forced_leb = forced_leb
 
     def scan(self) -> List[UBIRegion]:
+        log.info("Scanner: locating EC headers (%d bytes)...", len(self.data))
         ec_headers = self._find_ec_headers()
-        if not ec_headers: return []
+        if not ec_headers:
+            log.warning("Scanner: no EC headers found")
+            return []
         peb_size = self._determine_peb_size(ec_headers)
+        log.info("Scanner: %d EC headers, PEB=0x%X (%d B)", len(ec_headers), peb_size, peb_size)
         regions_raw = self._group_regions(ec_headers, peb_size)
+        log.info("Scanner: %d region group(s) (image_seq/gap grouping)", len(regions_raw))
         regions = []
-        for region_ecs in regions_raw:
+        for i, region_ecs in enumerate(regions_raw):
+            log.info("Scanner: region group %d: %d PEBs @0x%X..0x%X",
+                     i, len(region_ecs), region_ecs[0].offset,
+                     region_ecs[-1].offset + peb_size)
             region = self._process_region(region_ecs, peb_size)
             if region: regions.append(region)
         return regions
@@ -629,6 +823,7 @@ class UBIScanner:
                     pbar.update(idx - pos)
                     pos = idx + ECHeader.SIZE
                 else: pos = idx + 4
+        log.info("EC scan: %d EC header(s) found", len(headers))
         return headers
 
     def _determine_peb_size(self, ec_headers: List[ECHeaderInfo]) -> int:
@@ -667,7 +862,9 @@ class UBIScanner:
             peb_count=len(ec_headers), ec_headers=ec_headers,
             start_offset_clean=start_offset, end_offset_clean=end_offset, peb_size_clean=peb_size
         )
-        region.vid_headers = self._scan_vid_headers(ec_headers, vid_hdr_off)
+        region.vid_headers = self._scan_vid_headers_gen2(ec_headers, vid_hdr_off)
+        log.info("Region: PEB=0x%X LEB=0x%X vhf=0x%X doff=0x%X — %d VID header(s)",
+                 peb_size, leb_size, vid_hdr_off, data_off, len(region.vid_headers))
 
         leb_map: Dict[int, Dict[int, bytes]] = {}
         for vid in region.vid_headers:
@@ -679,7 +876,10 @@ class UBIScanner:
         ec_values = [h.ec for h in ec_headers]
         for vid_id, lebs in leb_map.items():
             if vid_id >= 0x7FFFEFFF: continue
-            assembled = self._assemble_lebs(lebs)
+            assembled = self._assemble_lebs_bounded(lebs, vid_id)
+            log.info("Volume %d ('%s'): %d LEB(s), max_lnum=%d, assembled %d B",
+                     vid_id, vol_names.get(vid_id, f"vol_{vid_id}"), len(lebs),
+                     max(lebs.keys()) if lebs else -1, len(assembled))
             fs_type, fs_end, _ = FilesystemDetector.detect(assembled)
             vol_name = vol_names.get(vid_id, f"vol_{vid_id}")
             sample_vid = next((v for v in region.vid_headers if v.vol_id == vid_id), None)
@@ -736,6 +936,78 @@ class UBIScanner:
             result.extend(lebs.get(i, b"\xff" * leb_size))
         return bytes(result)
 
+    # ── Gen2: bounded assembly (Bug B fix, additive) ────────────────────────
+    #
+    # The legacy _assemble_lebs materializes max_lnum+1 LEBs from an
+    # unvalidated u32 VID field. A single garbage VID header (CRC never
+    # checked in v1.0) with a huge lnum (e.g. 0x80000056 on the Cudy WR3000
+    # dump) allocates (lnum+1) × leb_size ≈ 253,952 GiB → kernel OOM kill
+    # at ~87 GB RSS. The bound below is derived from the image itself:
+    # no volume can span more LEBs than the image physically holds.
+    LNUM_SPAN_SAFETY = 4  # allow up to 4× image capacity before capping
+
+    def _assemble_lebs_bounded(self, lebs: Dict[int, bytes], vol_id: int) -> bytes:
+        if not lebs: return b""
+        leb_size = len(next(iter(lebs.values())))
+        max_lnum = max(lebs.keys())
+        image_capacity = max(1, len(self.data) // max(leb_size, 1))
+        span_cap = image_capacity * self.LNUM_SPAN_SAFETY
+        if max_lnum + 1 > span_cap:
+            log.warning("Volume %d: VID lnum span %d exceeds image-derived bound "
+                        "%d (leb_size=%d, image=%d B) — capping. Poison VID "
+                        "headers likely (CRC-unchecked vendor image).",
+                        vol_id, max_lnum + 1, span_cap, leb_size, len(self.data))
+            sane = {ln: data for ln, data in lebs.items() if ln < span_cap}
+            return self._assemble_lebs(sane)
+        return self._assemble_lebs(lebs)
+
+    def _scan_vid_headers_gen2(self, ec_headers: List[ECHeaderInfo], vid_hdr_off: int) -> List[VIDHeaderInfo]:
+        """Gen2 VID scan (additive — legacy _scan_vid_headers untouched):
+        same parse, plus:
+          - per-VID CRC verification (convention auto-detected from EC
+            headers: plain crc32 or vendor-inverted ~crc32)
+          - lnum sanity bound (8× PEB count) — poison VIDs above the bound
+            are dropped from volume assembly (kept in the JSON dump via
+            crc_ok/crc_conv annotation)
+        Fall back to legacy results when gen2 finds nothing (defensive).
+        """
+        votes: Dict[str, int] = {}
+        for ec in ec_headers[:32]:
+            ok, c = ECHeader._verify(self.data, ec.offset)
+            if ok:
+                key = c.split("@")[0]
+                votes[key] = votes.get(key, 0) + 1
+        conv = max(votes.items(), key=lambda kv: kv[1])[0] if votes else None
+        log.info("VID scan (gen2): EC-CRC convention vote: %s %s",
+                 conv or "unknown", votes if votes else "(no valid EC CRCs)")
+        self._crc_convention = conv
+
+        max_sane_lnum = max(8 * len(ec_headers), 64)
+        vid_headers: List[VIDHeaderInfo] = []
+        n_dropped = 0
+        for i, ec in enumerate(ec_headers):
+            vid_offset = ec.offset + vid_hdr_off
+            if vid_offset + VIDHeader.SIZE > len(self.data): continue
+            vid = VIDHeader.parse(self.data, vid_offset, i)
+            if not vid: continue
+            ok, c = VIDHeader._verify(self.data, vid_offset)
+            vid.crc_ok, vid.crc_conv = ok, c
+            if vid.lnum > max_sane_lnum:
+                n_dropped += 1
+                log.debug("VID @0x%X: lnum=%d exceeds sane bound %d — dropped",
+                          vid_offset, vid.lnum, max_sane_lnum)
+                continue
+            vid_headers.append(vid)
+        if n_dropped:
+            log.info("VID scan (gen2): dropped %d VID header(s) with insane lnum "
+                     "(bound=%d)", n_dropped, max_sane_lnum)
+        if not vid_headers:
+            log.warning("VID scan (gen2): no VIDs survived — falling back to legacy scan")
+            return self._scan_vid_headers(ec_headers, vid_hdr_off)
+        log.info("VID scan (gen2): %d valid VID headers (%d ECs, max sane lnum=%d)",
+                 len(vid_headers), len(ec_headers), max_sane_lnum)
+        return vid_headers
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  EXTRACTOR
@@ -789,9 +1061,21 @@ class Extractor:
         return leb_map
 
     def _assemble_lebs(self, lebs: Dict[int, bytes], leb_size: int) -> bytes:
-        """Helper to assemble LEBs, filling missing LNUMs with 0xFF."""
+        """Legacy signature preserved. Gen2: delegates to the shared bounded
+        assembler so the OOM bound protects extraction too."""
+        return Extractor.assemble_lebs_static(lebs, leb_size)
+
+    @staticmethod
+    def assemble_lebs_static(lebs: Dict[int, bytes], leb_size: int) -> bytes:
         if not lebs: return b""
         max_lnum = max(lebs.keys())
+        image_capacity = max(1, 256 * 1024 * 1024 // max(leb_size, 1))
+        span_cap = image_capacity * UBIScanner.LNUM_SPAN_SAFETY
+        if max_lnum + 1 > span_cap:
+            log.warning("assemble: lnum span %d exceeds bound %d — capping "
+                        "(poison VID headers likely)", max_lnum + 1, span_cap)
+            lebs = {ln: data for ln, data in lebs.items() if ln < span_cap}
+            max_lnum = max(lebs.keys())
         result = bytearray()
         for i in range(max_lnum + 1):
             result.extend(lebs.get(i, b"\xff" * leb_size))
