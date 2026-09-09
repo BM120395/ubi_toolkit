@@ -661,7 +661,7 @@ class ECHeader:
     @staticmethod
     def _verify(data: bytes, offset: int) -> Tuple[bool, str]:
         """Verify an EC header's CRC. Accepts the plain crc32 (Linux), the
-        vendor-inverted ~crc32 (e.g. Cudy/BCM), or a 60-byte coverage variant.
+        vendor-inverted ~crc32, or a 60-byte coverage variant.
         Returns (ok, convention) — pure additive validator, never raises."""
         try:
             stored = struct.unpack_from(">I", data, offset+60)[0]
@@ -670,7 +670,7 @@ class ECHeader:
         if stored == 0xFFFFFFFF or stored == 0x00000000:
             return False, "blank"
         cov = 60
-        # Some vendors (Cudy/BCM) XOR-out the CRC word; also cover variant lengths
+        # Some vendors XOR-out the CRC word; also cover variant lengths
         for coverage in (60, 64):
             if coverage > len(data) - offset: continue
             base = zlib.crc32(data[offset:offset+coverage]) & 0xFFFFFFFF
@@ -940,9 +940,10 @@ class UBIScanner:
     #
     # The legacy _assemble_lebs materializes max_lnum+1 LEBs from an
     # unvalidated u32 VID field. A single garbage VID header (CRC never
-    # checked in v1.0) with a huge lnum (e.g. 0x80000056 on the Cudy WR3000
-    # dump) allocates (lnum+1) × leb_size ≈ 253,952 GiB → kernel OOM kill
-    # at ~87 GB RSS. The bound below is derived from the image itself:
+    # checked in v1.0) with a huge lnum allocates
+    # (lnum+1) × leb_size (a poison value like 0x80000056 observed in the
+    # wild → ≈253,952 GiB) → kernel OOM kill at ~87 GB RSS. The bound below
+    # is derived from the image itself:
     # no volume can span more LEBs than the image physically holds.
     LNUM_SPAN_SAFETY = 4  # allow up to 4× image capacity before capping
 
