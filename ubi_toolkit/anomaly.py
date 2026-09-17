@@ -717,10 +717,11 @@ def scan_anomalies(data: bytes, reference: Optional[bytes] = None,
     probe_data: bytes = data
     if ctx.reference is not None:
         if len(ctx.reference) != len(data):
-            ctx.findings.append(Finding(
-                "ANOM-2", "fatal",
-                f"reference size {len(ctx.reference)} != image size "
-                f"{len(data)} — sizes must match for bit-rot evidence"))
+            # Volume-level reference (v1.3.0): a known-good VOLUME image
+            # (smaller than the dump) cannot patch raw pages, but it does
+            # adjudicate the page layout by content matching — skip the
+            # byte-level ANOM-2 path instead of aborting the scan.
+            _adjudicate_layout_volume_ref(ctx, data)
             return ctx
         sig = bitrot_signature(data, ctx.reference)
         ctx.stats["bitrot"] = sig
@@ -871,6 +872,171 @@ def apply_repairs(ctx: AnomalyContext,
         log.append("nothing to repair (layout findings are assembly hints, "
                    "not byte patches)")
     return (bytes(out) if not dry_run else ctx.data), log
+
+
+# ---------------------------------------------- page-layout deinterleaving
+# ANOM-1's byte-level remedy: rewrite the image so every physical page
+# keeps only the FS slices (the inline-ECC gap and trailing OOB-rescue
+# bytes are dropped). Everything downstream (OOB strip, UBI scanner,
+# volume assembly, extraction) then works on a clean, contiguous image.
+
+def strip_page_layout(data: bytes, page_stride: int,
+                      slices: Tuple[Tuple[int, int], ...]) -> bytes:
+    """Rewrite image page-by-page keeping only FS slices per page.
+
+    Every `page_stride` bytes of `data` is a physical page; output is the
+    concatenation of its FS slices (from a layout hypothesis adjudicated by
+    ANOM-1). Padding at the tail beyond the last full page is dropped."""
+    if page_stride <= 0:
+        return data
+    fs_len = sum(b - a for a, b in slices)
+    out = bytearray()
+    for pos in range(0, len(data) - page_stride + 1, page_stride):
+        page = data[pos:pos + page_stride]
+        for a, b in slices:
+            out += page[a:b]
+    return bytes(out)
+
+
+def adjudicated_layout(ctx: "AnomalyContext"
+                       ) -> Optional[Tuple[str, int, Tuple[Tuple[int, int], ...],
+                                           Optional[int], Optional[int]]]:
+    """The ANOM-1 layout finding packaged for consumers (None = full-page)."""
+    return ctx.page_layout
+
+
+# ---------------------------------------------- volume-reference adjudication
+# A known-good VOLUME image (e.g. the FS image from a sibling dump of the
+# same firmware) identifies the page layout by content matching: under the
+# true layout, LEB prefixes appear verbatim in the reference; under any
+# wrong layout the bytes are ECC-shifted and match nothing. This works even
+# when uncorrected bit rot masks VID data_crc probing, and the reference
+# then patches the extracted volumes (post-extraction, evidence-gated).
+
+def _adjudicate_layout_volume_ref(ctx: "AnomalyContext", data: bytes) -> None:
+    """Set ctx.page_layout from a volume reference, if one matches."""
+    ps, dp = ctx.page_stride, ctx.data_pages
+    if not ps or not dp or ctx.vid_offset is None or not ctx.ec_offsets:
+        return
+    ref = ctx.reference
+    if ref is None:
+        return
+    vo = ctx.vid_offset
+    invert = bool(ctx.crc_inverted)
+    vids = collect_vids(data, ctx.ec_offsets, ctx.vid_offset, invert,
+                        sample_limit=SAMPLE_PEB_LIMIT)
+    vids = [v for v in vids if v[1] > 512] or vids
+    if not vids:
+        return
+    page_data = 1 << (ps - 1).bit_length()
+    if page_data > ps:
+        page_data >>= 1
+
+    def _windows_ok(slices, fs_per_page):
+        """>=2 of the first 3 multi-page LEBs: a 64 KB window at the LEB's
+        reference position is isolated-single-bit vs the reference. Under
+        the true layout this is aged bit rot; under any wrong layout the
+        bytes are ECC-shifted and diff wholesale (rate >> 1%)."""
+        wins = tried = 0
+        for peb_off, _dsz, _dcrc in vids[:3]:
+            vid = recover_vid(data[peb_off + vo:peb_off + vo + VID_HDR_SZ],
+                              invert)
+            if vid is None:
+                continue
+            lnum = vid_fields(vid)[0]
+            leb = assemble_leb(data, peb_off, ps, dp, slices, min_bytes=1 << 16)
+            rpos = lnum * (dp * fs_per_page)
+            if rpos < 0 or rpos >= len(ref) or len(leb) < (1 << 16):
+                continue
+            rend = min(rpos + (1 << 16), len(ref))
+            tried += 1
+            sig = bitrot_signature(leb[:rend - rpos], ref[rpos:rend])
+            if sig["is_bitrot"]:
+                wins += 1
+        return wins >= 2 and tried >= 2, wins
+
+    def _probe_ok(slices, fs_per_page):
+        """Whole-page XOR probe (cheap pre-screen for the sweep): the first
+        data page of the first recoverable LEB must match the reference at
+        the lnum-derived offset within a small byte budget (bit rot). A
+        wrong gap position/width shifts most bytes past the knee and fails."""
+        peb_off = vids[0][0]
+        vid = recover_vid(data[peb_off + vo:peb_off + vo + VID_HDR_SZ],
+                          invert)
+        if vid is None:
+            return False
+        lnum = vid_fields(vid)[0]
+        page = data[peb_off + 2 * ps:peb_off + 3 * ps]
+        fs_page = b"".join(page[a:b] for a, b in slices)
+        rpos = lnum * (dp * fs_per_page)
+        if rpos < 0 or rpos + len(fs_page) > len(ref):
+            return False
+        x = int.from_bytes(fs_page, "little") ^ \
+            int.from_bytes(ref[rpos:rpos + len(fs_page)], "little")
+        diff = sum(1 for b in x.to_bytes(len(fs_page), "little") if b)
+        return diff <= 48
+
+    win: Optional[Tuple[str, int, Tuple, Optional[int], Optional[int]]] = None
+    if _windows_ok(((0, ps),), ps)[0]:
+        win = ("full-page", ps, ((0, ps),), None, None)
+    if win is None and _windows_ok(((0, page_data),), page_data)[0]:
+        win = (f"data-only({page_data})", page_data,
+               ((0, page_data),), None, None)
+    if win is None and page_data >= GAP_SEARCH_MIN + 64:
+        for g in GAP_SIZES:
+            if GAP_SEARCH_MIN + g >= page_data:
+                continue
+            for k in range(GAP_SEARCH_MIN, page_data - g, GAP_SEARCH_ALIGN):
+                sl = ((0, k), (k + g, page_data))
+                if _probe_ok(sl, page_data) and _windows_ok(sl, page_data)[0]:
+                    win = (f"gap@{k}/{g}", page_data, sl, k, g)
+                    break
+            if win:
+                break
+    if win is None and ps > page_data + 8 and page_data >= GAP_SEARCH_MIN + 64:
+        # Sweep cost control: cheap positional 512-byte probe (VID lnum gives
+        # the exact reference offset — no haystack search) across the full
+        # grid, then confirm the winners with the 64 KB window signature.
+        oob_w = ps - page_data
+        for g in GAP_SIZES:
+            if GAP_SEARCH_MIN + g >= page_data:
+                continue
+            confirmed = None
+            for w in range(8, min(17, oob_w - 2), 2):
+                for start in (page_data + 2, ps - w):
+                    for k in range(GAP_SEARCH_MIN, page_data - g,
+                                   GAP_SEARCH_ALIGN):
+                        sl = ((0, k), (k + g, page_data), (start, start + w))
+                        if _probe_ok(sl, page_data) and \
+                                _windows_ok(sl, page_data)[0]:
+                            confirmed = (k, g, w, start)
+                            break
+                    if confirmed:
+                        break
+                if confirmed:
+                    break
+            if confirmed:
+                k, g2, w2, start = confirmed
+                win = (f"gap+oob@{k}/{g2}+{w2}", page_data,
+                       ((0, k), (k + g2, page_data), (start, start + w2)),
+                       k, g2)
+                break
+    if win is None:
+        return
+    name, pd, slices, gap_pos, gap_size = win
+    hits = _windows_ok(slices, pd)[1]
+    ctx.page_layout = (name, pd, slices, gap_pos, gap_size)
+    ctx.findings.append(Finding(
+        "ANOM-1", "repairable",
+        f"page layout '{name}' adjudicated by volume reference "
+        f"({hits}/3 LEB 64KB-windows pass bit-rot signature) — "
+        f"data area is ECC-interleaved; naive assembly shifts pages",
+        {"winner": name, "gap_pos": gap_pos, "gap_size": gap_size}))
+    plan = f"assemble with layout '{name}'"
+    if gap_pos is not None:
+        plan += f" (skip gap {gap_size}B at {gap_pos:#x})"
+    ctx.repair_plan.append(plan)
+    ctx.stats["volume_reference"] = {"bytes": len(ref), "window_hits": hits}
 
 
 def fail_fast_message(ctx: AnomalyContext, tool: str) -> Optional[str]:

@@ -177,6 +177,34 @@ def _run_analyst(firmware: Path, output: Path, args: argparse.Namespace) -> int:
     return 0
 
 
+def _patch_volumes_with_reference(out: Path, ref: bytes, verbose: bool) -> None:
+    """v1.3.0: patch extracted volume images against a volume-level
+    reference (evidence-gated: only isolated single-bit rot is repaired)."""
+    from ubi_toolkit.anomaly import bitrot_signature, repair_bitrot
+    vols = sorted(p for p in out.glob("ubi/region_*/volumes/*") if p.is_file())
+    if not vols:
+        print("[AUTO-FIX] volume reference: no extracted volumes found")
+        return
+    for v in vols:
+        data = v.read_bytes()
+        sig = bitrot_signature(data, ref)
+        if not sig["diff_bytes"]:
+            print(f"[AUTO-FIX] {v.name}: already matches reference")
+            continue
+        if not sig["is_bitrot"]:
+            if verbose:
+                print(f"[AUTO-FIX] {v.name}: differences vs reference are "
+                      f"not bit rot ({sig['diff_bytes']} bytes, max run "
+                      f"{sig['max_run']}) — skipped")
+            continue
+        buf = bytearray(data)
+        repaired, multi = repair_bitrot(buf, ref)
+        v.write_bytes(bytes(buf))
+        residual = bitrot_signature(bytes(buf), ref)["diff_bytes"]
+        print(f"[AUTO-FIX] {v.name}: repaired {repaired} bit-rot bytes vs "
+              f"reference ({multi} multi-bit left, residual {residual})")
+
+
 def op_analyze(args: argparse.Namespace) -> int:
     if not args.firmware:
         print("error: -s/--source required for analyze", file=sys.stderr)
@@ -225,11 +253,31 @@ def op_analyze(args: argparse.Namespace) -> int:
                 fixed_path.write_bytes(repaired)
                 print(f"[AUTO-FIX] repaired image written: {fixed_path}")
                 fw = fixed_path  # continue the pipeline on the repaired image
+            # ANOM-1 adjudicated layout (v1.3.0): deinterleave the image
+            # page-by-page so the analyst sees clean FS pages. The scan ran
+            # on the pre-fix image; its evidence probes already used the
+            # bit-rot-repaired view, so layout adjudication is unaffected.
+            if ctx.page_layout is not None and ctx.page_stride:
+                _name, _pd, slices = ctx.page_layout[0], ctx.page_layout[1], \
+                    ctx.page_layout[2]
+                from ubi_toolkit.anomaly import strip_page_layout
+                laid = strip_page_layout(fw.read_bytes(), ctx.page_stride,
+                                         slices)
+                laid_path = fw.with_suffix(".layout.bin")
+                laid_path.write_bytes(laid)
+                print(f"[AUTO-FIX] page layout '{_name}' applied: "
+                      f"{len(repaired):,} → {len(laid):,} bytes "
+                      f"({laid_path})")
+                fw = laid_path  # analyst consumes the deinterleaved image
     # end anomaly pre-scan
 
     rc = _run_analyst(fw, out, args)
     if rc != 0:
         return rc
+    # v1.3.0: volume-level reference patches the extracted volumes
+    # (evidence-gated single-bit rot repair, post-extraction).
+    if reference_bytes is not None and not args.dry_run:
+        _patch_volumes_with_reference(out, reference_bytes, args.verbose)
     # Sidecar — only if we actually produced an analysis tree
     if not args.report_only:
         # Detect region count by listing region_* subdirs
@@ -541,7 +589,7 @@ Examples:
     p.add_argument("-v", "--verbose", action="store_true",
                    help="Enable DEBUG logging")
     p.add_argument("--version", action="version",
-                   version="ubipack 1.2.0")
+                   version="ubipack 1.3.0")
     return p
 
 

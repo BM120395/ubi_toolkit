@@ -1,6 +1,16 @@
 # ubipack — UBI Firmware Analysis & Surgical Repacking Toolkit
 
-> **v1.2.0** — new in this iteration: `ubi_toolkit/anomaly.py` and
+> **v1.3.0** — new in this iteration: volume-level `--reference`. Pass a
+> known-good **volume** image (e.g. the FS image extracted from a sibling
+> dump) and the pre-scan adjudicates the inline-ECC page layout by content
+> matching (LEB prefixes must appear verbatim in the reference), then
+> patches the extracted volumes against it (isolated single-bit rot only —
+> evidence-gated, never blind). Size-matched references keep the existing
+> whole-image bit-rot behavior. Also new: `strip_page_layout()` — with
+> `--auto-fix`, an adjudicated layout is applied to the image
+> (`<input>.layout.bin`) before analysis.
+>
+> **v1.2.0** — `ubi_toolkit/anomaly.py` and
 > `ubipack --auto-fix/--reference` — a fail-fast anomaly pre-scan (exit 3 with
 > an exact rerun hint) covering bit rot vs a reference image, inline-ECC page
 > layouts, CRC-convention variants, and single-bit VID repair, generalized to
