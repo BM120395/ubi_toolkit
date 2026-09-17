@@ -253,7 +253,15 @@ def op_analyze(args: argparse.Namespace) -> int:
                 fixed_path.write_bytes(repaired)
                 print(f"[AUTO-FIX] repaired image written: {fixed_path}")
                 fw = fixed_path  # continue the pipeline on the repaired image
-            # ANOM-1 adjudicated layout (v1.3.0): deinterleave the image
+            else:
+                # No whole-image repair was possible. If layout adjudication
+                # also failed, the assembled volumes are ECC-shifted: warn.
+                if ctx.page_layout is None:
+                    print("[AUTO-FIX] WARNING: no page layout could be "
+                          "adjudicated — extracted volumes may be ECC-"
+                          "shifted/corrupt (no reference or no matching "
+                          "layout)")
+                # ANOM-1 adjudicated layout (v1.3.0): deinterleave the image
             # page-by-page so the analyst sees clean FS pages. The scan ran
             # on the pre-fix image; its evidence probes already used the
             # bit-rot-repaired view, so layout adjudication is unaffected.
@@ -589,7 +597,7 @@ Examples:
     p.add_argument("-v", "--verbose", action="store_true",
                    help="Enable DEBUG logging")
     p.add_argument("--version", action="version",
-                   version="ubipack 1.3.0")
+                   version="ubipack 1.3.1")
     return p
 
 

@@ -811,13 +811,11 @@ def scan_anomalies(data: bytes, reference: Optional[bytes] = None,
             elif full_rate is not None and full_rate < 0.5 and \
                     best["arate"] < LAYOUT_MIN_RATE:
                 if ctx.reference is None:
-                    rot = any(f.kind == "ANOM-2" for f in ctx.findings)
-                    hint = ("bit rot uncorrected: rerun with --reference "
-                            "KNOWN_GOOD.bin for evidence-based repair"
-                            if rot else
-                            "no bit rot detected: unknown page layout or "
-                            "data-area convention (inspect OOB/ECC placement "
-                            "manually)")
+                    hint = ("if a known-good image/volume exists, rerun with "
+                            "--reference KNOWN_GOOD — bit rot may be present "
+                            "but is undetectable (and layout adjudication "
+                            "masks data_crc) without it; otherwise inspect "
+                            "OOB/ECC placement manually")
                     note = (f"no layout hypothesis passes data_crc (best "
                             f"{best['name']} {best['arate']:.2f}) — {hint}")
                 else:
