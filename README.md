@@ -1,5 +1,14 @@
 # ubipack — UBI Firmware Analysis & Surgical Repacking Toolkit
 
+> **v1.2.0** — new in this iteration: `ubi_toolkit/anomaly.py` and
+> `ubipack --auto-fix/--reference` — a fail-fast anomaly pre-scan (exit 3 with
+> an exact rerun hint) covering bit rot vs a reference image, inline-ECC page
+> layouts, CRC-convention variants, and single-bit VID repair, generalized to
+> any geometry. Plus `case_studies/`: a documented real-world NAND recovery as
+> a self-contained reference module (`ubi_toolkit/case_studies/`). Read-only
+> reference code for the anomaly engine; not wired into any CLI operation.
+> See `case_studies/README.md`.
+
 A unified CLI that wraps the UBI analyst + surgical repacker scripts into
 a single installable command. Mirrors the `sqpack` architecture: top-level
 launcher + Python package + `pyproject.toml` console-script entry point.

@@ -5,7 +5,7 @@ Operations (one chosen per invocation, mirroring sqpack's flat-flag style):
 
     analyze     Scan a firmware blob, detect NAND geometry, locate UBI regions
                 and inner filesystems (SquashFS/JFFS2/CramFS/UBIFS/DTB).
-                Wraps analyst.FirmwareAnalyst (OpenWUI_upg-06).
+                Wraps analyst.FirmwareAnalyst.
     extract     Alias for analyze that always writes the extracted tree.
     repack      Surgical clean-UBI repack: replace one or more UBI volumes
                 inside a previously-analyzed image without disturbing other
@@ -186,6 +186,47 @@ def op_analyze(args: argparse.Namespace) -> int:
         print(f"error: firmware not found: {fw}", file=sys.stderr)
         return 2
     out = Path(args.output).expanduser().resolve()
+
+    # Anomaly pre-scan (v1.2.0): read-only, cheap, runs before the parse.
+    # Repairable findings fail fast (exit 3) with a rerun hint unless
+    # --auto-fix was given; --reference enables the bit-rot (ANOM-2) check.
+    reference_bytes: Optional[bytes] = None
+    if getattr(args, "reference", None):
+        ref_path = Path(args.reference).expanduser().resolve()
+        if not ref_path.exists():
+            print(f"error: reference image not found: {ref_path}", file=sys.stderr)
+            return 2
+        reference_bytes = ref_path.read_bytes()
+    if getattr(args, "auto_fix", False) or reference_bytes is not None:
+        from ubi_toolkit.anomaly import (
+            apply_repairs,
+            fail_fast_message,
+            scan_anomalies,
+        )
+        ctx = scan_anomalies(fw.read_bytes(), reference=reference_bytes,
+                             verbose=args.verbose)
+        if ctx.findings:
+            print("[ANOMALY-SCAN] " + ctx.summary())
+            for f in ctx.findings:
+                print(f"  {f}")
+        if ctx.has_repairable and not args.auto_fix:
+            msg = fail_fast_message(ctx, "ubipack")
+            if msg:
+                print(msg, file=sys.stderr)
+            return 3
+        if args.auto_fix:
+            repaired, actions = apply_repairs(ctx, dry_run=args.dry_run)
+            for a in actions:
+                print(f"[AUTO-FIX] {a}")
+            if args.dry_run:
+                return 0
+            if repaired != fw.read_bytes():
+                fixed_path = fw.with_suffix(".autofix.bin")
+                fixed_path.write_bytes(repaired)
+                print(f"[AUTO-FIX] repaired image written: {fixed_path}")
+                fw = fixed_path  # continue the pipeline on the repaired image
+    # end anomaly pre-scan
+
     rc = _run_analyst(fw, out, args)
     if rc != 0:
         return rc
@@ -469,6 +510,16 @@ Examples:
     p.add_argument("--report-only", action="store_true",
                    help="Analyze: scan only, do not extract (analyze-only)")
 
+    # Anomaly scan / auto-fix (v1.2.0)
+    p.add_argument("--auto-fix", dest="auto_fix", action="store_true",
+                   help="Analyze/extract: detect + repair anomalies (bit rot, "
+                        "inline-ECC page layouts, single-bit VID damage) and "
+                        "continue. Without it, repairable anomalies fail fast "
+                        "with a rerun hint")
+    p.add_argument("--reference", dest="reference",
+                   help="Known-good image for bit-rot detection/repair "
+                        "(enables ANOM-2 evidence)")
+
     # Repack-specific
     p.add_argument("--replace", action="append",
                    metavar="regionN:volume=FILE",
@@ -490,7 +541,7 @@ Examples:
     p.add_argument("-v", "--verbose", action="store_true",
                    help="Enable DEBUG logging")
     p.add_argument("--version", action="version",
-                   version="ubipack 1.1.0")
+                   version="ubipack 1.2.0")
     return p
 
 

@@ -2,7 +2,7 @@
 """
 clean_ubi_surgical_repacker_itr04.py
 
-Surgical clean-UBI repacker for output produced by ubi_analyst_mod-OpenWUI_upg-06.py.
+Surgical clean-UBI repacker for output produced by the ubi_toolkit analyst stage.
 
 itr04 changes (from itr03):
   CRITICAL FIX: infer_volume_names() and extracted_volume_path() only globbed

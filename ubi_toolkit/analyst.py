@@ -80,12 +80,27 @@ VOL_TYPE_NAMES = {VOL_DYNAMIC: "dynamic", VOL_STATIC: "static"}
 VTBL_RECORD_SIZE = 172
 VTBL_MAX_VOLUMES = 128
 
+# Tier-1 standard-geometry table (fast if/else path, v1.1.2) — standard
+# open-source NAND page/OOB geometries. The original five remain at the
+# top (byte-for-byte, untouched); the additions are the common variants
+# (SLC/MLC page sizes 256B–16K, OOB 8B–1280B). Additive only: detection
+# filters every entry against the image's raw EB size, so an entry that
+# cannot fit is simply skipped.
 NAND_GEOMETRIES = [
     (512, 16),
     (2048, 64),
     (2048, 128),
     (4096, 128),
     (4096, 256),
+    # v1.1.2 additions (standard table)
+    (256, 8),
+    (512, 8),
+    (1024, 32),
+    (1024, 64),
+    (2048, 32),
+    (4096, 64),
+    (8192, 64),
+    (16384, 128),
 ]
 
 # ── Filesystem magic signatures for raw scanning ──────────────────────────
@@ -150,6 +165,9 @@ class VIDHeaderInfo:
     offset_raw: Optional[int] = None
     crc_ok: Optional[bool] = None      # gen2: result of VIDHeader._verify (None = not checked)
     crc_conv: Optional[str] = None     # gen2: which CRC convention matched
+    # v1.1.2 (Fix 2): gated lnum repair annotations
+    lnum_raw: Optional[int] = None     # original lnum field before repair
+    lnum_repair: Optional[str] = None  # 'single-bit' | 'peb-order' | None
 
 
 @dataclass
@@ -227,6 +245,13 @@ class FoundFS:
     size_clean: int = 0
     raw_span_size: int = 0
     detected_in: List[str] = field(default_factory=list)
+    # v1.1.2 (Fix 3): when an FS found by the raw/clean orphan scan actually
+    # lies INSIDE a UBI region's span, it is routed to that region's
+    # volumes/ directory instead of the global other_fs/. These fields carry
+    # the routing decision (region index None = truly outside every region).
+    region_index: Optional[int] = None
+    vol_id_hint: Optional[int] = None
+    lnum_hint: Optional[int] = None
 
 
 @dataclass
@@ -480,13 +505,21 @@ class OOBDetector:
             log.info("Auto-detected geometry: page=%dB, OOB=%dB", page_size, oob_size)
             return self._build_geometry(page_size, oob_size, raw_eb)
 
-        gen2 = self._disambiguate_geometry_gen2(candidates, f1)
-        if gen2 is not None:
-            page_size, oob_size = gen2
-        else:
-            # gen2 found no decisive evidence — fall back to legacy heuristic
+        try:
+            gen3 = self._disambiguate_geometry_gen3(candidates, f1)
+            if gen3 is not None:
+                page_size, oob_size = gen3
+            else:
+                gen2 = self._disambiguate_geometry_gen2(candidates, f1)
+                if gen2 is not None:
+                    page_size, oob_size = gen2
+                else:
+                    # gen2/gen3 found no decisive evidence — fall back to legacy heuristic
+                    page_size, oob_size = self._measure_stride(candidates)
+                    log.info("Gen2/Gen3 disambiguation inconclusive — legacy _measure_stride used")
+        except Exception as exc:
+            log.warning("Gen3/Gen2 disambiguation failed (%s) — legacy _measure_stride used", exc)
             page_size, oob_size = self._measure_stride(candidates)
-            log.info("Gen2 disambiguation inconclusive — legacy _measure_stride used")
         log.info("Disambiguated geometry: page=%dB, OOB=%dB", page_size, oob_size)
         return self._build_geometry(page_size, oob_size, raw_eb)
 
@@ -573,6 +606,360 @@ class OOBDetector:
                      "(v1.0 legacy default)", len(tied), best_score)
             best_page, best_oob = tied[0][1], tied[0][2]
         return best_page, best_oob
+
+    # ── Gen3: tiered geometry disambiguation (additive, v1.1.2) ─────────────
+    #
+    # Empirical result from the validation images: on raw-NAND UBI dumps the
+    # EC/VID/VTBL header positions are RATIO-EQUIVALENT for same-ratio
+    # candidates ((512,16) and (2048,64) both map clean 0x800 -> raw 0x840),
+    # so structural evidence alone (gen2) can never split them. Two evidence
+    # sources DO split them:
+    #
+    #   1. VID/VTBL presence per candidate (eliminates wrong-page-count
+    #      candidates, e.g. (4096,128) maps vhf 0x800 to a different raw
+    #      offset) — but the gen2 window (16 EBs) can be too short: images
+    #      exist where the first 40+ PEBs of a region are EC-only (erased
+    #      but EC-incremented) and the first VID comes much later. Gen3
+    #      therefore extends the window adaptively until it contains
+    #      min_vid_evid VIDs (or the window exceeds max_frac of the EC span).
+    #   2. OOB-zone FF density on WRITTEN PEBs: a written NAND page carries
+    #      ECC/strict-bytes in its OOB area (mostly non-FF), while a wrong
+    #      candidate's "OOB" windows overlap page DATA (mostly non-FF too)
+    #      — the true candidate maximises (oob_ff - data_ff) divergence.
+    #      Measured to rank the true geometry #1 across the whole validation
+    #      set; used ONLY as the ratio-pair splitter, with a margin guard:
+    #      a thin margin (< FF_MARGIN_MIN) is logged and falls back to the
+    #      smallest-page legacy default instead of guessing.
+    #
+    # Everything is additive: gen3 failure of any kind falls through to gen2
+    # (structural), then _measure_stride (legacy), without raising.
+    GEN3_MIN_VID_EVID = 32       # window grows until this many VID magics seen
+    GEN3_MAX_EB_STEPS = 16       # window grows in this many raw EBs per step
+    GEN3_MAX_EB_FRACTION = 0.9   # ... never beyond this fraction of EC span
+    FF_MARGIN_MIN = 0.05         # min (best - second) FF-delta margin to trust
+    FS_VALIDATE_MARGIN = 0.05    # FF margin below this → decisive tier engages
+    FS_VALIDATE_MIN_DELTA = 0.01 # decisive tier needs a real FF signal at all
+    FS_VALIDATE_MIN_RATE = 0.60  # decisive tier: min node-CRC pass rate to accept
+    FS_VALIDATE_MAX_BYTES = 64 * 1024 * 1024   # per-candidate assembly cap
+    FS_VALIDATE_MAX_EBS = 512    # per-candidate LEB-span cap
+
+    def _disambiguate_geometry_gen3(self, candidates: list, first_ec_off: int) -> Optional[Tuple[int, int]]:
+        """Gen3 (v1.1.2): adaptive-window structural scoring (gen2 rules, longer
+        window) + OOB FF-density tie-break between ratio-equivalent survivors.
+        Returns (page, oob) or None (fall through to gen2). Never raises."""
+        try:
+            return self._gen3_impl(candidates, first_ec_off)
+        except Exception as exc:
+            log.warning("Gen3 disambiguation failed internally (%s) — continuing", exc)
+            return None
+
+    def _gen3_impl(self, candidates: list, first_ec_off: int) -> Optional[Tuple[int, int]]:
+        try:
+            first_ec = ECHeader.parse(self.data, first_ec_off, 0)
+        except Exception:
+            first_ec = None
+        vhf = first_ec.vid_hdr_offset if first_ec else 0x800
+        doff = first_ec.data_offset if first_ec else 0x1000
+
+        # EC span upper bound for the window cap (EC count * raw EB).
+        total = len(self.data)
+        raw_eb0 = None
+        f2 = self.data.find(UBI_EC_MAGIC, first_ec_off + 1)
+        raw_eb0 = (f2 - first_ec_off) if f2 > 0 else None
+        span_cap_ebs = None
+        if raw_eb0:
+            n_ec = self.data.count(UBI_EC_MAGIC)
+            span_cap_ebs = max(self.GEN3_MAX_EB_STEPS,
+                               int((n_ec * raw_eb0) * self.GEN3_MAX_EB_FRACTION / raw_eb0))
+
+        fs_magics = [m for m, _, _, _, _ in FS_SCAN_SIGNATURES]
+        scored = []
+        window_ebs = self.GEN3_MAX_EB_STEPS
+        while True:
+            win_raw = self.data[first_ec_off: first_ec_off + window_ebs * raw_eb0] \
+                if raw_eb0 else b""
+            if not win_raw:
+                break
+            per_cand = []
+            for page_size, oob_size, stride, pages, clean_eb in candidates:
+                raw_eb = stride * pages
+                win_clean = bytearray()
+                pos = 0
+                while pos + page_size <= len(win_raw):
+                    win_clean.extend(win_raw[pos:pos + page_size])
+                    pos += stride
+                win_clean = bytes(win_clean)
+                n_eb = len(win_clean) // clean_eb
+                ec_hits = vid_hits = ec_crc = fs_hits = vtbl_names = 0
+                for k in range(n_eb):
+                    base = k * clean_eb
+                    if win_clean[base:base + 4] != UBI_EC_MAGIC:
+                        continue
+                    ec_hits += 1
+                    ok, _c = ECHeader._verify(win_clean, base)
+                    if ok:
+                        ec_crc += 1
+                    vbase = base + vhf
+                    if vbase + 12 <= len(win_clean) and win_clean[vbase:vbase + 4] == UBI_VID_MAGIC \
+                            and win_clean[vbase + 8:vbase + 12] == struct.pack(">I", VolumeTable.VTBL_VOL_ID):
+                        dchunk = win_clean[base + doff: base + doff + clean_eb - doff]
+                        vtbl_names += len(VolumeTable.parse(dchunk))
+                        continue
+                    if vbase + 4 <= len(win_clean) and win_clean[vbase:vbase + 4] == UBI_VID_MAGIC:
+                        vid_hits += 1
+                    dbase = base + doff
+                    for m in fs_magics:
+                        if win_clean[dbase:dbase + len(m)] == m:
+                            fs_hits += 1
+                            break
+                score = (fs_hits, vtbl_names, ec_crc, ec_hits, vid_hits)
+                per_cand.append((score, page_size, oob_size, stride))
+            # adaptive stop: some candidate sees >= MIN_VID_EVID VID magics
+            if any(s[0][4] >= self.GEN3_MIN_VID_EVID for s in per_cand):
+                scored = per_cand
+                log.info("Gen3: window %d EBs — %d VID evidence reached",
+                         window_ebs, max(s[0][4] for s in per_cand))
+                break
+            if span_cap_ebs and window_ebs >= span_cap_ebs:
+                scored = per_cand
+                log.info("Gen3: window %d EBs (EC-span cap) — best VID evidence %d",
+                         window_ebs, max((s[0][4] for s in per_cand), default=0))
+                break
+            if first_ec_off + (window_ebs + self.GEN3_MAX_EB_STEPS) * (raw_eb0 or 0) > total:
+                scored = per_cand
+                log.info("Gen3: window %d EBs (image end) — best VID evidence %d",
+                         window_ebs, max((s[0][4] for s in per_cand), default=0))
+                break
+            window_ebs += self.GEN3_MAX_EB_STEPS
+        if not scored:
+            return None
+        for score, page_size, oob_size, stride in scored:
+            log.info("Gen3 candidate page=%d oob=%d: fs=%d vtbl=%d ec_crc=%d "
+                     "ec_hits=%d vid=%d", page_size, oob_size, *score)
+
+        scored.sort(key=lambda t: t[0], reverse=True)
+        best_score = scored[0][0]
+        if best_score == (0, 0, 0, 0, 0):
+            log.info("Gen3: no structural evidence at all")
+            return None
+        tied = [s for s in scored if s[0] == best_score]
+        if len(tied) == 1:
+            log.info("Gen3: structural evidence decided page=%d oob=%d",
+                     tied[0][1], tied[0][2])
+            return tied[0][1], tied[0][2]
+
+        # ratio-equivalent survivors (same structural score) → FF-density delta
+        log.info("Gen3: %d candidates tie at %s — OOB FF-density tie-break",
+                 len(tied), best_score)
+        ff_scores = []
+        for _score, page_size, oob_size, stride in tied:
+            ff = self._ff_density_delta(first_ec_off, window_ebs, page_size,
+                                        oob_size, stride)
+            if ff is not None:
+                ff_scores.append((ff, page_size, oob_size))
+            log.info("Gen3 FF-density (page=%d oob=%d): %s",
+                     page_size, oob_size,
+                     "n/a (no written PEBs in window)" if ff is None else f"{ff:+.4f}")
+        if not ff_scores:
+            return None
+        ff_scores.sort(key=lambda t: t[0], reverse=True)
+        if len(ff_scores) > 1:
+            margin = ff_scores[0][0] - ff_scores[1][0]
+            if margin < self.FS_VALIDATE_MARGIN and ff_scores[0][0] >= self.FS_VALIDATE_MIN_DELTA:
+                # thin FF margin → decisive tier: FS-content validation
+                log.info("Gen3: FF-density margin %.4f < %.4f — falling through "
+                         "to FS-content decisive tier", margin, self.FS_VALIDATE_MARGIN)
+                decided = self._fs_validate_tied(first_ec_off, window_ebs, ff_scores, vhf, doff)
+                if decided is not None:
+                    return decided
+                log.info("Gen3: FS-content decisive tier inconclusive — "
+                         "preferring smallest page (v1.0 legacy default)")
+                return None
+            if margin < self.FS_VALIDATE_MARGIN:
+                log.info("Gen3: FF-density margin %.4f < %.4f — thin; "
+                         "preferring smallest page (v1.0 legacy default)",
+                         margin, self.FS_VALIDATE_MARGIN)
+                return None
+            log.info("Gen3: FF-density margin %.4f — decided page=%d oob=%d",
+                     margin, ff_scores[0][1], ff_scores[0][2])
+        return ff_scores[0][1], ff_scores[0][2]
+
+    # ── Gen3 decisive tier: FS-content validation (v1.1.2) ──────────────────
+    #
+    # Rationale: for ratio-equivalent candidates the EC/VID/VTBL header
+    # positions coincide and the FF-density delta can be thin. The ONLY
+    # signal that cannot be faked by a wrong page size is deep FS content:
+    # under the wrong page size the volume data stream is shredded, so
+    # filesystem-internal integrity structures (UBIFS node chain CRCs,
+    # SquashFS metadata) fail, while under the true geometry they validate.
+    # Measured on the validation set (UBIFS volumes): true geometry passes
+    # ~100% of node-chain CRCs; wrong ratio-equivalent candidates < 11%.
+    #
+    # UBIFS node chain: common header <IIQIBB2s> (magic 'UBI#$', node CRC
+    # u32 @+4, sqnum @+8, len u32 @+16, type/group @+20/21); nodes are
+    # 8-byte aligned inside each LEB; node CRC covers node[8:len].
+    # Vendor convention check: plain crc32 AND inverted (~crc32) accepted,
+    # mirroring the EC/VID CRC convention handling elsewhere in this file.
+
+    @staticmethod
+    def _ubifs_node_crc_rate(blob: bytes, leb_size: int) -> Optional[float]:
+        """Walk UBIFS node chains in an assembled volume image; return the
+        fraction of nodes whose stored header CRC validates. None if the
+        image holds no UBIFS nodes at all."""
+        magic = b"\x31\x18\x10\x06"
+        total = ok = 0
+        if leb_size <= 0:
+            return None
+        for li in range(len(blob) // leb_size):
+            d = blob[li * leb_size: (li + 1) * leb_size]
+            pos = 0
+            while pos + 24 <= leb_size:
+                if d[pos:pos + 4] != magic:
+                    break
+                crc = struct.unpack_from("<I", d, pos + 4)[0]
+                ln = struct.unpack_from("<I", d, pos + 16)[0]
+                if ln < 24 or pos + ln > leb_size:
+                    break
+                calc_plain = zlib.crc32(d[pos + 8: pos + ln]) & 0xFFFFFFFF
+                calc_inv = (~calc_plain) & 0xFFFFFFFF
+                total += 1
+                ok += 1 if crc in (calc_plain, calc_inv) else 0
+                pos = (pos + ln + 7) & ~7
+        return (ok / total) if total else None
+
+    def _fs_validate_tied(self, first_ec_off: int, window_ebs: int, tied: list,
+                          vhf: int, doff: int) -> Optional[Tuple[int, int]]:
+        """Decisive tie-break: for each surviving candidate, assemble the
+        largest volume's LEB chain and score UBIFS node-chain CRC pass rate
+        (SquashFS volumes are scored by the same routine's caller fallback —
+        None rate just means no UBIFS nodes). Highest rate above
+        FS_VALIDATE_MIN_RATE wins; ties prefer the smaller page. Never raises."""
+        try:
+            results = []
+            for _ff, page_size, oob_size in tied:
+                stride = page_size + oob_size
+                rate = self._fs_validate_candidate(first_ec_off, page_size,
+                                                   oob_size, stride, vhf, doff)
+                if rate is not None:
+                    results.append((rate, page_size, oob_size))
+                log.info("Gen3 FS-validate (page=%d oob=%d): node-crc rate=%s",
+                         page_size, oob_size,
+                         "n/a" if rate is None else f"{rate:.4f}")
+            if not results:
+                return None
+            results.sort(key=lambda t: t[0], reverse=True)
+            if results[0][0] < self.FS_VALIDATE_MIN_RATE:
+                return None
+            if len(results) > 1 and results[0][0] == results[1][0]:
+                log.info("Gen3 FS-validate: perfect tie — smallest page wins")
+            log.info("Gen3 FS-validate: decided page=%d oob=%d (rate %.4f)",
+                     results[0][1], results[0][2], results[0][0])
+            return results[0][1], results[0][2]
+        except Exception as exc:
+            log.warning("Gen3 FS-validate failed internally (%s)", exc)
+            return None
+
+    def _fs_validate_candidate(self, first_ec_off: int, page_size: int,
+                               oob_size: int, stride: int, vhf: int,
+                               doff: int) -> Optional[float]:
+        """Assemble the largest volume's LEB chain under one candidate
+        geometry and return its UBIFS node-CRC pass rate (None if no UBI/UBIFS
+        evidence). Heavily bounded: span ≤ FS_VALIDATE_MAX_EBS LEBs and
+        ≤ FS_VALIDATE_MAX_BYTES per candidate."""
+        raw_eb = None
+        f2 = self.data.find(UBI_EC_MAGIC, first_ec_off + 1)
+        raw_eb = (f2 - first_ec_off) if f2 > 0 else 0
+        if not raw_eb or raw_eb % stride:
+            return None
+        pages_per_eb = raw_eb // stride
+        clean_eb = pages_per_eb * page_size
+        if clean_eb <= doff:
+            return None
+        leb_size = clean_eb - doff
+        vid_raw_in_peb = (vhf // page_size) * stride
+        dat_raw_in_peb = (doff // page_size) * stride
+
+        vols: Dict[int, Dict[int, bytes]] = {}
+        off = first_ec_off
+        while off + raw_eb <= len(self.data):
+            peb = self.data[off: off + raw_eb]
+            off += raw_eb
+            if peb[:4] != UBI_EC_MAGIC:
+                continue
+            vid_raw_pos = vid_raw_in_peb
+            if vid_raw_pos + 12 > len(peb):
+                continue
+            if peb[vid_raw_pos: vid_raw_pos + 4] != UBI_VID_MAGIC:
+                continue
+            vol_id = struct.unpack(">I", peb[vid_raw_pos + 8: vid_raw_pos + 12])[0]
+            lnum = struct.unpack(">I", peb[vid_raw_pos + 12: vid_raw_pos + 16])[0] & 0xFFFF
+            if vol_id >= 0x7FFFEFFF:
+                continue
+            data = bytearray()
+            pos = dat_raw_in_peb
+            while pos + page_size <= len(peb):
+                data.extend(peb[pos: pos + page_size])
+                pos += stride
+            vols.setdefault(vol_id, {})[lnum] = bytes(data)
+
+        if not vols:
+            return None
+        vol_id = max(vols, key=lambda v: len(vols[v]))
+        lebs = vols[vol_id]
+        span = (max(lebs) + 1) if lebs else 0
+        if span <= 0 or span > self.FS_VALIDATE_MAX_EBS:
+            return None
+        span = min(span, self.FS_VALIDATE_MAX_EBS)
+        if span * leb_size > self.FS_VALIDATE_MAX_BYTES:
+            return None
+        blob = bytearray()
+        for i in range(span):
+            blob.extend(lebs.get(i, b"\xff" * leb_size))
+        return self._ubifs_node_crc_rate(bytes(blob), leb_size)
+
+    def _ff_density_delta(self, first_ec_off: int, window_ebs: int,
+                          page_size: int, oob_size: int, stride: int) -> Optional[float]:
+        """(FF fraction in OOB windows) - (FF fraction in data windows), over
+        WRITTEN raw PEBs of the window. Returns None if no written PEBs found.
+        A PEB counts as written when neither its data nor OOB is all-FF."""
+        if not oob_size or not page_size:
+            return None
+        n_eb = 0
+        oob_ff = data_ff = 0.0
+        n_written = 0
+        raw_eb = None
+        f2 = self.data.find(UBI_EC_MAGIC, first_ec_off + 1)
+        raw_eb = (f2 - first_ec_off) if f2 > 0 else 0
+        if not raw_eb:
+            return None
+        while n_eb < window_ebs:
+            peb_base = first_ec_off + n_eb * raw_eb
+            peb = self.data[peb_base: peb_base + raw_eb]
+            n_eb += 1
+            if not peb:
+                break
+            pages = len(peb) // stride
+            p_data_ff = p_oob_ff = 0.0
+            n_d = n_o = 0
+            for k in range(pages):
+                d = peb[k * stride: k * stride + page_size]
+                o = peb[k * stride + page_size: k * stride + stride]
+                if d:
+                    p_data_ff += d.count(0xFF) / len(d); n_d += 1
+                if o:
+                    p_oob_ff += o.count(0xFF) / len(o); n_o += 1
+            if not n_d or not n_o:
+                continue
+            p_data_ff /= n_d; p_oob_ff /= n_o
+            if p_data_ff > 0.999 and p_oob_ff > 0.999:
+                continue  # erased PEB (EC-only) — no evidence
+            n_written += 1
+            oob_ff += p_oob_ff; data_ff += p_data_ff
+        if not n_written:
+            return None
+        log.debug("Gen3 FF: page=%d written=%d oob_ff=%.4f data_ff=%.4f",
+                  page_size, n_written, oob_ff / n_written, data_ff / n_written)
+        return (oob_ff / n_written) - (data_ff / n_written)
 
     def _measure_stride(self, candidates: list) -> Tuple[int, int]:
         try:
@@ -962,6 +1349,114 @@ class UBIScanner:
             return self._assemble_lebs(sane)
         return self._assemble_lebs(lebs)
 
+    # ── v1.1.2 (Fix 2): gated lnum repair ───────────────────────────────────
+    #
+    # Some vendor static volumes ship with bit-rot in the VID lnum u32
+    # (single-bit flips anywhere in the field, including vendor flag bits in
+    # the high half — normalised here with a 0xFFFF mask). The legacy scan
+    # either drops such VIDs as poison or assembles them at garbage lnums,
+    # so the volume loses its superblock LEB and the extracted FS comes out
+    # headless. Repair is GATED on static-volume proof so it can never
+    # rewrite a healthy image:
+    #   vol_type == STATIC for every VID ∧ used_ebs == VID count
+    #   → the true lnum set is provably exactly 0..n-1
+    #     1. normalise lnum &= 0xFFFF (high flag bits are never legal here)
+    #     2. single-bit repair of anomalous VIDs into unclaimed holes
+    #     3. unresolved anomalies filled by PEB order (ascending holes)
+    # Dynamic volumes with anomalies are diagnosed and warned, NOT guessed.
+    @staticmethod
+    def _single_bit_holes(value: int, holes: set) -> List[int]:
+        """Holes reachable from `value` by flipping exactly one bit (0..31)."""
+        return sorted(h for h in holes if bin(h ^ value).count("1") == 1)
+
+    def _repair_lnums_gated(self, group: List[VIDHeaderInfo], vol_id: int) -> None:
+        n = len(group)
+        if n < 2:
+            return
+        types = {v.vol_type for v in group}
+        used_counts = {}
+        for v in group:
+            used_counts[v.used_ebs] = used_counts.get(v.used_ebs, 0) + 1
+        used_consensus = max(used_counts.items(), key=lambda kv: kv[1])[0]
+
+        # classify anomalies on the normalised values first (needed for the
+        # dynamic-volume diagnostic even when the static gate fails):
+        # out-of-range values, plus duplicate claims AFTER the first
+        # occurrence in PEB order (the first claimant keeps its lnum, so
+        # anomaly count always equals the hole count by pigeonhole)
+        norm = [v.lnum & 0xFFFF for v in group]
+        order = sorted(range(n), key=lambda i: group[i].peb_index)
+        seen_claims = set()
+        anomalous_idx = set()
+        for i in order:
+            x = norm[i]
+            if x >= n or x in seen_claims:
+                anomalous_idx.add(i)
+            else:
+                seen_claims.add(x)
+        anomalous = [(i, norm[i]) for i in sorted(anomalous_idx,
+                     key=lambda i: group[i].peb_index)]
+
+        if types != {VOL_STATIC} or used_consensus != n:
+            if anomalous:
+                log.info(
+                    "Volume %d: %d lnum anomaly/ies (dups/out-of-range) but "
+                    "vol_type=%s used_ebs=%s ≠ static-with-n proof — repair "
+                    "gated OFF (diagnosis only, lnums not rewritten)",
+                    vol_id, len(anomalous), sorted(types), used_consensus)
+            return
+
+        # Gate passed: static volume, used_ebs == n → target set is 0..n-1.
+        if not anomalous:
+            return
+        log.info("Volume %d (static, used_ebs=%d, %d VIDs): %d anomalous "
+                 "lnum(s) — gated repair engaged",
+                 vol_id, used_consensus, n, len(anomalous))
+
+        holes = set(range(n)) - set(norm)
+        anomalous_sorted = sorted(anomalous, key=lambda t: group[t[0]].peb_index)
+
+        for idx, raw_norm in anomalous_sorted:
+            vid = group[idx]
+            vid.lnum_raw = vid.lnum
+            cands = self._single_bit_holes(raw_norm, holes)
+            if len(cands) == 1:
+                vid.lnum = cands[0]
+                vid.lnum_repair = "single-bit"
+                holes.discard(cands[0])
+                log.info("  PEB %d: lnum %d (raw 0x%X) → %d [single-bit]%s",
+                         vid.peb_index, raw_norm, vid.lnum_raw, vid.lnum,
+                         "" if vid.crc_ok in (None, False) else " [CRC ok]")
+            elif len(cands) > 1:
+                log.info("  PEB %d: lnum %d ambiguous (%d single-bit holes: %s)"
+                         " — deferred to PEB-order fill", vid.peb_index,
+                         raw_norm, len(cands), cands)
+
+        # PEB-order fill: remaining anomalies (in PEB order) take the
+        # remaining holes (ascending). By pigeonhole counts match exactly.
+        unresolved = [(idx, norm[idx]) for idx, _ in anomalous_sorted
+                      if group[idx].lnum_repair is None]
+        remaining = sorted(holes)
+        for (idx, _), hole in zip(unresolved, remaining):
+            vid = group[idx]
+            vid.lnum = hole
+            vid.lnum_repair = "peb-order"
+            log.info("  PEB %d: lnum %d (raw 0x%X) → %d [peb-order fill]",
+                     vid.peb_index, norm[idx], vid.lnum_raw, vid.lnum)
+
+        # verify: multiset must now be exactly 0..n-1
+        final = sorted(v.lnum for v in group)
+        if final == list(range(n)):
+            n_sb = sum(1 for v in group if v.lnum_repair == "single-bit")
+            n_po = sum(1 for v in group if v.lnum_repair == "peb-order")
+            log.info("Volume %d: lnum repair complete — %d single-bit, %d "
+                     "peb-order fill; lnums now contiguous 0..%d",
+                     vol_id, n_sb, n_po, n - 1)
+        else:
+            log.warning("Volume %d: lnum repair verification failed "
+                        "(final set not 0..%d) — leaving repaired values in "
+                        "place", vol_id, n - 1)
+
     def _scan_vid_headers_gen2(self, ec_headers: List[ECHeaderInfo], vid_hdr_off: int) -> List[VIDHeaderInfo]:
         """Gen2 VID scan (additive — legacy _scan_vid_headers untouched):
         same parse, plus:
@@ -984,8 +1479,7 @@ class UBIScanner:
         self._crc_convention = conv
 
         max_sane_lnum = max(8 * len(ec_headers), 64)
-        vid_headers: List[VIDHeaderInfo] = []
-        n_dropped = 0
+        all_vids: List[VIDHeaderInfo] = []
         for i, ec in enumerate(ec_headers):
             vid_offset = ec.offset + vid_hdr_off
             if vid_offset + VIDHeader.SIZE > len(self.data): continue
@@ -993,13 +1487,41 @@ class UBIScanner:
             if not vid: continue
             ok, c = VIDHeader._verify(self.data, vid_offset)
             vid.crc_ok, vid.crc_conv = ok, c
-            if vid.lnum > max_sane_lnum:
-                n_dropped += 1
-                log.debug("VID @0x%X: lnum=%d exceeds sane bound %d — dropped",
-                          vid_offset, vid.lnum, max_sane_lnum)
+            all_vids.append(vid)
+
+        # v1.1.2 (Fix 2): gated lnum repair BEFORE the sanity drop. Repaired
+        # values land in 0..n-1 by construction; unrepaired poison VIDs are
+        # still subject to the legacy bound below.
+        # Attach segmentation: layout (internal) VID headers mark the start
+        # of each UBI attach. Images shipping two banks under ONE image_seq
+        # (merged into a single region) restart lnum numbering at each bank's
+        # layout volume — the static-volume gate (used_ebs == n) must see
+        # each attach's VIDs alone, so groups are split per attach segment.
+        seg_of: Dict[int, int] = {}
+        seg = 0
+        for v in sorted(all_vids, key=lambda x: x.peb_index):
+            if v.vol_id >= 0x7FFFEFFF:
+                seg += 1
+            seg_of[id(v)] = seg
+        by_vol: Dict[Tuple[int, int], List[VIDHeaderInfo]] = {}
+        for v in all_vids:
+            if v.vol_id >= 0x7FFFEFFF:
                 continue
-            vid_headers.append(vid)
+            by_vol.setdefault((v.vol_id, seg_of[id(v)]), []).append(v)
+        for (vol_id, _seg), group in by_vol.items():
+            try:
+                self._repair_lnums_gated(group, vol_id)
+            except Exception as exc:
+                log.warning("Volume %d: gated lnum repair failed (%s) — "
+                            "continuing with unrepaired lnums", vol_id, exc)
+
+        vid_headers = [v for v in all_vids if v.lnum <= max_sane_lnum]
+        n_dropped = len(all_vids) - len(vid_headers)
         if n_dropped:
+            for v in all_vids:
+                if v.lnum > max_sane_lnum:
+                    log.debug("VID @0x%X: lnum=%d exceeds sane bound %d — dropped",
+                              v.offset, v.lnum, max_sane_lnum)
             log.info("VID scan (gen2): dropped %d VID header(s) with insane lnum "
                      "(bound=%d)", n_dropped, max_sane_lnum)
         if not vid_headers:
@@ -1250,10 +1772,35 @@ class Extractor:
 
     def scan_for_orphan_fs(self, regions: List[UBIRegion], warnings_list: List[str]) -> List[FoundFS]:
         found: List[FoundFS] = []
-        covered_clean = set()
+        # ── v1.1.2 (Fix 3): region-span routing ────────────────────────────
+        # The legacy 0x1000-step covered_clean set silently missed FS magics
+        # at non-step-aligned offsets INSIDE a region span (e.g. a SquashFS
+        # embedded mid-stream inside a UBIFS volume LEB) — those leaked to
+        # the global other_fs/ dir even though they are region content.
+        # New logic (additive; legacy behaviour preserved outside regions):
+        #   1. volume LEB data starts (vid.offset - vhf + data_offset) are
+        #      "covered" — their content is extracted as the volume itself;
+        #   2. any other FS magic inside a region span [start, end) is an
+        #      EMBEDDED region FS → routed to that region's volumes/ dir;
+        #   3. everything outside all regions stays a true other_fs/ orphan.
+        vol_data_starts: set = set()
         for region in regions:
-            for i in range(region.start_offset_clean, min(region.end_offset_clean, len(self.clean_data)), 0x1000):
-                covered_clean.add(i)
+            for vid in region.vid_headers:
+                try:
+                    peb_start = vid.offset - region.vid_hdr_offset
+                    vol_data_starts.add(peb_start + region.data_offset)
+                except Exception:
+                    pass
+
+        def region_of(clean_off: int) -> Optional[Tuple[int, "UBIRegion"]]:
+            if clean_off is None:
+                return None
+            for ri, region in enumerate(regions):
+                start_c = region.start_offset_clean
+                end_c = region.end_offset_clean
+                if start_c is not None and end_c is not None and start_c <= clean_off < end_c:
+                    return ri, region
+            return None
 
         raw_found = self._scan_by_magic(self.raw_data, is_raw=True)
         clean_found = self._scan_by_magic(self.clean_data, is_raw=False)
@@ -1277,7 +1824,12 @@ class Extractor:
 
         for entry in candidates.values():
             raw_off, clean_off, fs_type = entry["offset_raw"], entry["offset_clean"], entry["fs_type"]
-            if clean_off in covered_clean: continue
+
+            # Fix 3 routing decision
+            region_info = region_of(clean_off) if clean_off is not None else None
+            if clean_off is not None and clean_off in vol_data_starts:
+                continue  # FS magic at a volume LEB start — extracted as the volume
+            embedded = region_info is not None
 
             if clean_off is None:
                 validation = {"valid": False, "reason": "Raw offset lies inside OOB area", "meta": {}, "errors": ["OOB area"]}
@@ -1299,11 +1851,32 @@ class Extractor:
                 rs, re = OOBDetector.clean_range_to_raw_range(clean_off, clean_off + size_bytes, self.geom)
                 raw_span_size = re - rs
 
+            # Fix 3 hints: which region/volume/LEB does an embedded FS live in?
+            region_index = vol_id_hint = lnum_hint = None
+            if embedded:
+                region_index, region = region_info
+                try:
+                    peb_size_clean = region.peb_size_clean or 0
+                    if clean_off is not None and peb_size_clean > 0:
+                        peb_start = (clean_off // peb_size_clean) * peb_size_clean
+                        for vid in region.vid_headers:
+                            if vid.offset - region.vid_hdr_offset == peb_start:
+                                vol_id_hint = vid.vol_id if vid.vol_id < 0x7FFFEFFF else None
+                                lnum_hint = vid.lnum
+                                break
+                except Exception:
+                    pass
+                warnings_list.append(
+                    f"Embedded FS {fs_type} @ clean 0x{clean_off:X} inside region {region_index}"
+                    + (f" (vol {vol_id_hint} LEB {lnum_hint})" if vol_id_hint is not None else "")
+                    + f" — routed to region {region_index} volumes/")
+
             found_fs = FoundFS(
                 offset_raw=raw_off, offset_clean=clean_off, fs_type=fs_type, endian=entry["endian"],
                 size_bytes=size_bytes, size_verified=size_verified, validation=validation,
                 magic=entry.get("magic", ""), size_clean=size_bytes, raw_span_size=raw_span_size,
-                detected_in=entry["detected_in"]
+                detected_in=entry["detected_in"],
+                region_index=region_index, vol_id_hint=vol_id_hint, lnum_hint=lnum_hint
             )
             found.append(found_fs)
 
@@ -1344,10 +1917,23 @@ class Extractor:
 
     def _extract_orphan_fs(self, fs: FoundFS) -> None:
         if fs.size_bytes <= 0: return
-        out_dir = self.output_dir / "other_fs"
+        # v1.1.2 (Fix 3): an FS embedded inside a UBI region's span is region
+        # content — write it under that region's volumes/ dir (with vol/LEB
+        # hints in the name), never into the global other_fs/.
+        if fs.region_index is not None:
+            rdir = self.output_dir / "ubi" / f"region_{fs.region_index}" / "volumes"
+            rdir.mkdir(parents=True, exist_ok=True)
+            out_dir = rdir
+        else:
+            out_dir = self.output_dir / "other_fs"
         valid_tag = "VALID" if fs.validation.get("valid") else "INVALID"
         safe_type = fs.fs_type.replace("/", "_")
-        out_path = out_dir / f"{safe_type}_{fs.offset_raw:#010x}_{valid_tag}.bin"
+        name_extra = ""
+        if fs.region_index is not None:
+            name_extra = f"_emb_r{fs.region_index}"
+            if fs.vol_id_hint is not None:
+                name_extra += f"_v{fs.vol_id_hint}_l{fs.lnum_hint}"
+        out_path = out_dir / f"{safe_type}_{fs.offset_raw:#010x}_{valid_tag}{name_extra}.bin"
 
         if fs.offset_clean is not None and fs.offset_clean + fs.size_bytes <= len(self.clean_data):
             data = self.clean_data[fs.offset_clean:fs.offset_clean + fs.size_bytes]
