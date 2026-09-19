@@ -52,12 +52,44 @@ sudo apt install python3-tk   # Debian / Ubuntu
 
 ## Install
 
-There are four ways to use it. Pick one.
+There are five ways to install it. Pick one.
 
-### Option A — `uv tool install` (recommended, isolated)
+### Option A — self-install (no pip/uv/venv needed, recommended)
 
-Installs `ubipack` as a standalone command in its own virtual environment
-(the same way this tool is installed on the author's machine):
+Since v1.6.0 ubipack manages its own installation: it copies the pure-stdlib
+package under `--prefix` and writes a `ubipack` shim, tracked by an uninstall
+manifest. No pip, no uv, no virtualenv, no sudo (default prefix `~/.local`).
+
+```bash
+# from a release tarball or a git clone of this repo
+python3 -m ubi_toolkit.ubipack --install     # or: ./ubipack.py --install
+```
+
+Lifecycle shortcuts:
+
+| Command | Effect |
+|---|---|
+| `ubipack --install` (`-I`) | install / upgrade in place (idempotent) |
+| `ubipack --upgrade` | fetch the latest tarball from GitHub and reinstall |
+| `ubipack --upgrade-url URL` | upgrade from a custom tarball URL or local path |
+| `ubipack --uninstall` (`-U`) | manifest-driven uninstall (removes only what it created) |
+| `ubipack --uninstall --force` | also remove a foreign (non-lifecycle) shim |
+| `ubipack -K DIR` (`--clean`) | list generated sidecars (`*.autofix.bin`, `*.layout.bin`) — dry run |
+| `ubipack -K DIR --yes` | apply the cleanup |
+| `ubipack ... --prefix DIR` | install location (default `~/.local`) |
+
+A pre-existing non-lifecycle `ubipack` shim (uv/pipx/pip) is never silently
+replaced — it is backed up to `ubipack.pre-lifecycle` first. GitHub-upgrade
+works from the very first self-install:
+
+```bash
+python3 -m ubi_toolkit.ubipack --install   # once
+ubipack --upgrade                          # every later version
+```
+
+### Option B — `uv tool install` (isolated, pre-built venv)
+
+Installs `ubipack` as a standalone command in its own virtual environment:
 
 ```bash
 # from the toolkit directory
@@ -67,7 +99,7 @@ uv tool install ./ubi_toolkit_v1.0
 uv tool install /path/to/ubi_toolkit_v1.0
 
 # or straight from the built wheel
-uv tool install ./dist/ubi_toolkit-1.0.0-py3-none-any.whl
+uv tool install ./dist/ubi_toolkit-<version>-py3-none-any.whl
 ```
 
 After install, `ubipack` is on `PATH` (via `~/.local/bin/ubipack`).
@@ -77,7 +109,7 @@ Include optional extras at install time:
 uv tool install --with tqdm ./ubi_toolkit_v1.0   # + progress bars
 ```
 
-### Option B — `pipx install`
+### Option C — `pipx install`
 
 ```bash
 # from the toolkit directory
@@ -87,12 +119,12 @@ pipx install ./ubi_toolkit_v1.0
 pipx install /path/to/ubi_toolkit_v1.0
 
 # or straight from the built wheel
-pipx install ./dist/ubi_toolkit-1.0.0-py3-none-any.whl
+pipx install ./dist/ubi_toolkit-<version>-py3-none-any.whl
 ```
 
 Optional extras after install: `pipx inject ubipack tqdm` (progress bars).
 
-### Option C — `pip` in a venv
+### Option D — `pip` in a venv
 
 ```bash
 python3 -m venv .venv && . .venv/bin/activate
@@ -104,7 +136,7 @@ pip install .
 pip install /path/to/ubi_toolkit_v1.0
 
 # or straight from the built wheel
-pip install ./dist/ubi_toolkit-1.0.0-py3-none-any.whl
+pip install ./dist/ubi_toolkit-<version>-py3-none-any.whl
 
 # editable install (live code changes, run from the toolkit directory)
 pip install -e .
@@ -113,14 +145,14 @@ pip install -e .
 pip install .[tqdm]
 ```
 
-### Option D — install from the prebuilt distribution files
+### Option E — install from the prebuilt distribution files
 
 `dist/` contains both packaging formats, built from this exact tree:
 
 ```bash
-uv tool install ./dist/ubi_toolkit-1.0.0-py3-none-any.whl   # wheel
-pip install ./dist/ubi_toolkit-1.0.0-py3-none-any.whl
-pip install ./dist/ubi_toolkit-1.0.0.tar.gz                 # sdist
+uv tool install ./dist/ubi_toolkit-<version>-py3-none-any.whl   # wheel
+pip install ./dist/ubi_toolkit-<version>-py3-none-any.whl
+pip install ./dist/ubi_toolkit-<version>.tar.gz                 # sdist
 ```
 
 ### No-install quickstart
@@ -134,8 +166,9 @@ python3 ubipack.py --help
 ### Verifying the install
 
 ```bash
-ubipack --version      # → 1.0.0
-ubipack -t             # toolchain + submodule sanity check
+ubipack --version      # → ubipack 1.6.0
+ubipack -t             # toolchain + submodules + lifecycle round-trip check
+python3 -m unittest tests.test_lifecycle -v   # test suite (from the repo root)
 ```
 
 ## Operations
@@ -150,6 +183,10 @@ One operation per invocation, selected by a single short flag (sqpack style):
 | `-c` | `compare`    | Compare two analysis directories                        |
 | `-V` | `verify`     | Re-audit analysis output (VID CRC + EC magic/CRC)       |
 | `-t` | `self-test`  | Toolchain availability + submodule import sanity        |
+
+Lifecycle (v1.6.0): `-I/--install` · `-U/--uninstall` · `--upgrade` ·
+`-K/--clean PATH` — see *Installation, Option A*. Anomaly pre-scan runs on
+every analyze: `--auto-fix` (+ `--reference KNOWN_GOOD` for bit-rot repair).
 
 ## Examples
 
@@ -199,7 +236,10 @@ ubi_toolkit/
     ├── ubipack.py         # unified CLI dispatcher
     ├── analyst.py         # UBI region detection + extract
     ├── repacker.py        # Surgical volume replacement
-    └── ecc_runtime.py     # NAND ECC layout handling
+    ├── ecc_runtime.py     # NAND ECC layout handling
+    ├── anomaly.py         # anomaly engine (ANOM-1..5) + --auto-fix
+    ├── bootimg.py         # uImage / FIT payload extraction
+    └── lifecycle.py       # self-install / uninstall / upgrade / clean
 ```
 
 ## Submodules
@@ -216,7 +256,7 @@ the CLI dispatcher auto-uses whatever is there.
 
 ## Iteration Discipline
 
-This is **v1.0.0**. As in the `sqpack` workflow, each new iteration
+This is **v1.6.0**. As in the `sqpack` workflow, each new iteration
 (`v1.1.0`, `v1.2.0`, …) is a fresh directory copy; prior iterations stay
 frozen and remain installed/usable. Within an iteration, the named scope
 is the hard boundary — don't refactor across versions.
