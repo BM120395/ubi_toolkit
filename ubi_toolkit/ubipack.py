@@ -136,7 +136,17 @@ def op_self_test(_args: argparse.Namespace) -> int:
         from ubi_toolkit import analyst, repacker, ecc_runtime  # noqa: F401
         print("  submodules   : OK (analyst, repacker, ecc_runtime)")
     except Exception as e:
-        print(f"  submodules   : FAIL ({e})")
+        print("  submodules   : FAIL (%s)" % e)
+        return 1
+    # Lifecycle round-trip (v1.6.0): temp prefix only, never touches ~/.local
+    try:
+        from ubi_toolkit import lifecycle
+        ok, msg = lifecycle.self_test_roundtrip()
+        print("  lifecycle    : %s (%s)" % ("OK" if ok else "FAIL", msg))
+        if not ok:
+            return 1
+    except Exception as e:
+        print("  lifecycle    : FAIL (%s)" % e)
         return 1
     print("=" + "=" * 49)
     print("Self-test complete.")
@@ -205,6 +215,51 @@ def _patch_volumes_with_reference(out: Path, ref: bytes, verbose: bool) -> None:
               f"reference ({multi} multi-bit left, residual {residual})")
 
 
+def _resolve_reference_volume(ref: bytes) -> bytes:
+    """v1.4.0: --reference may be a raw UBI image (e.g. a vendor sysupgrade
+    .bin). Extract its dominant data volume by VID lnum so volume-level
+    adjudication/patching sees clean LEB-concatenated bytes. Non-UBI
+    references (already a volume / squashfs) pass through unchanged."""
+    from ubi_toolkit.anomaly import (
+        VOL_ID_INTERNAL, assemble_leb, derive_geometry, detect_crc_convention,
+        recover_vid, vid_fields, VID_HDR_SZ,
+    )
+    if b"UBI#" not in ref:
+        return ref
+    geo = derive_geometry(ref)
+    grid = geo.get("ec_grid") or []
+    vo = geo.get("vid_offset")
+    ps, dp = geo.get("page_stride"), geo.get("data_pages")
+    if not grid or vo is None or not ps or not dp:
+        return ref
+    invert = bool(detect_crc_convention(ref, grid, vo))
+    vol_maps: dict = {}
+    for peb_off in grid[:4096]:
+        vid = recover_vid(ref[peb_off + vo:peb_off + vo + VID_HDR_SZ],
+                          invert)
+        if vid is None:
+            continue
+        vol_id = int.from_bytes(vid[8:12], "big")
+        if vol_id >= VOL_ID_INTERNAL:
+            continue
+        lnum = vid_fields(vid)[0]
+        vol_maps.setdefault(vol_id, {}).setdefault(lnum, peb_off)
+    if not vol_maps:
+        return ref
+    # dominant volume = most mapped LEBs
+    vol_id, m = max(vol_maps.items(), key=lambda kv: len(kv[1]))
+    out = bytearray()
+    for ln in range(max(m) + 1):
+        p = m.get(ln)
+        leb_bytes = dp * ps
+        if p is None:
+            out += b"\x00" * leb_bytes
+        else:
+            out += assemble_leb(ref, p, ps, dp, ((0, ps),),
+                                min_bytes=leb_bytes)
+    return bytes(out)
+
+
 def op_analyze(args: argparse.Namespace) -> int:
     if not args.firmware:
         print("error: -s/--source required for analyze", file=sys.stderr)
@@ -214,24 +269,31 @@ def op_analyze(args: argparse.Namespace) -> int:
         print(f"error: firmware not found: {fw}", file=sys.stderr)
         return 2
     out = Path(args.output).expanduser().resolve()
+    layout_applied: Optional[str] = None
 
     # Anomaly pre-scan (v1.2.0): read-only, cheap, runs before the parse.
     # Repairable findings fail fast (exit 3) with a rerun hint unless
     # --auto-fix was given; --reference enables the bit-rot (ANOM-2) check.
     reference_bytes: Optional[bytes] = None
+    reference_volume: Optional[bytes] = None
     if getattr(args, "reference", None):
         ref_path = Path(args.reference).expanduser().resolve()
         if not ref_path.exists():
             print(f"error: reference image not found: {ref_path}", file=sys.stderr)
             return 2
         reference_bytes = ref_path.read_bytes()
+        reference_volume = _resolve_reference_volume(reference_bytes)
+        if reference_volume is not reference_bytes:
+            print(f"[REFERENCE] UBI image detected — extracted clean "
+                  f"volume ({len(reference_volume):,} B) from it for "
+                  f"adjudication/patching")
     if getattr(args, "auto_fix", False) or reference_bytes is not None:
         from ubi_toolkit.anomaly import (
             apply_repairs,
             fail_fast_message,
             scan_anomalies,
         )
-        ctx = scan_anomalies(fw.read_bytes(), reference=reference_bytes,
+        ctx = scan_anomalies(fw.read_bytes(), reference=reference_volume,
                              verbose=args.verbose)
         if ctx.findings:
             print("[ANOMALY-SCAN] " + ctx.summary())
@@ -277,6 +339,7 @@ def op_analyze(args: argparse.Namespace) -> int:
                       f"{len(repaired):,} → {len(laid):,} bytes "
                       f"({laid_path})")
                 fw = laid_path  # analyst consumes the deinterleaved image
+                layout_applied = _name
     # end anomaly pre-scan
 
     rc = _run_analyst(fw, out, args)
@@ -284,8 +347,24 @@ def op_analyze(args: argparse.Namespace) -> int:
         return rc
     # v1.3.0: volume-level reference patches the extracted volumes
     # (evidence-gated single-bit rot repair, post-extraction).
-    if reference_bytes is not None and not args.dry_run:
-        _patch_volumes_with_reference(out, reference_bytes, args.verbose)
+    if reference_volume is not None and not args.dry_run:
+        _patch_volumes_with_reference(out, reference_volume, args.verbose)
+    # v1.5.0: boot-image discovery (uImage/FIT). When --auto-fix applied a
+    # page layout, `fw` already points at the stripped image (flag set
+    # above); otherwise scan the raw image. Catches kernel/U-Boot/DTB
+    # images stored OUTSIDE the UBI region (raw NAND partitions);
+    # UBI-hosted boot volumes are extracted by the analyst.
+    try:
+        from ubi_toolkit import bootimg
+        view: bytes = fw.read_bytes()
+        view_name = f"stripped:{layout_applied}" if layout_applied \
+            else "raw"
+        boot_dir = out / "boot_images"
+        entries = bootimg.extract_all(view, boot_dir, layout_name=view_name)
+        if not entries:
+            print("[BOOT-IMG] no uImage/FIT images found")
+    except Exception as exc:  # boot extraction must never kill analyze
+        print(f"[BOOT-IMG] skipped ({exc})")
     # Sidecar — only if we actually produced an analysis tree
     if not args.report_only:
         # Detect region count by listing region_* subdirs
@@ -541,6 +620,21 @@ Examples:
     mode.add_argument("-t", "--self-test", dest="op_self_test", action="store_true",
                       help="Verify toolchain availability and import sanity")
 
+    # Lifecycle (v1.6.0): self-managed install/uninstall/upgrade/clean
+    mode.add_argument("-I", "--install", dest="op_install", action="store_true",
+                      help="Install/upgrade this tool under --prefix "
+                           "(default ~/.local): package copy + shim in "
+                           "<prefix>/bin + uninstall manifest")
+    mode.add_argument("-U", "--uninstall", dest="op_uninstall", action="store_true",
+                      help="Remove a lifecycle install (manifest-driven; "
+                           "cleans the shim from <prefix>/bin)")
+    mode.add_argument("--upgrade", dest="op_upgrade", action="store_true",
+                      help="Fetch the latest toolkit tarball from the "
+                           "repository and reinstall it")
+    mode.add_argument("-K", "--clean", dest="clean", nargs="+", metavar="PATH",
+                      help="List (dry-run) generated artifacts under PATH "
+                           "(<fw>.autofix.bin / <fw>.layout.bin); --yes applies")
+
     # Common paths
     p.add_argument("-s", "--source", dest="firmware",
                    help="Input firmware binary (for analyze/extract)")
@@ -583,7 +677,15 @@ Examples:
     p.add_argument("--dry-run", action="store_true",
                    help="Repack: preflight only, write nothing")
     p.add_argument("--yes", action="store_true",
-                   help="Repack: skip interactive confirmation")
+                   help="Repack/upgrade: skip interactive confirmation")
+    p.add_argument("--force", action="store_true",
+                   help="Lifecycle: overwrite/replace even when the existing "
+                        "shim or target is not lifecycle-managed")
+    p.add_argument("--prefix", metavar="DIR",
+                   help="Lifecycle: install prefix (default ~/.local)")
+    p.add_argument("--upgrade-url", dest="upgrade_url", metavar="URL",
+                   help="Upgrade: tarball URL or local tarball path "
+                        "(default: repository default branch)")
     p.add_argument("--allow-roundtrip-skip", action="store_true",
                    help="Repack: allow mutation when no analyst .bin exists")
 
@@ -597,7 +699,7 @@ Examples:
     p.add_argument("-v", "--verbose", action="store_true",
                    help="Enable DEBUG logging")
     p.add_argument("--version", action="version",
-                   version="ubipack 1.3.1")
+                   version="ubipack 1.6.0")
     return p
 
 
@@ -620,6 +722,18 @@ def main() -> int:
         try:
             if args.op_self_test:
                 return op_self_test(args)
+            if getattr(args, "op_install", False):
+                from ubi_toolkit import lifecycle
+                return lifecycle.op_install(args)
+            if getattr(args, "op_uninstall", False):
+                from ubi_toolkit import lifecycle
+                return lifecycle.op_uninstall(args)
+            if getattr(args, "op_upgrade", False):
+                from ubi_toolkit import lifecycle
+                return lifecycle.op_upgrade(args)
+            if getattr(args, "clean", None):
+                from ubi_toolkit import lifecycle
+                return lifecycle.op_clean(args)
             if args.op_analyze:
                 return op_analyze(args)
             if args.op_extract:
