@@ -1570,10 +1570,90 @@ class Extractor:
         (rdir / "headers" / "ec_headers.json").write_text(json.dumps([asdict(h) for h in region.ec_headers], indent=2))
         (rdir / "headers" / "vid_headers.json").write_text(json.dumps([asdict(h) for h in region.vid_headers], indent=2))
 
+        # v1.8.0: detect and persist the original image's CRC convention so the
+        # repacker recomputes CRCs with the SAME formula the vendor used.
+        try:
+            crc_conv = self._detect_crc_convention(
+                region.ec_headers, region.vid_headers, clean_region,
+                base_offset=clean_start if clean_start is not None else 0)
+        except Exception as exc:
+            crc_conv = {"convention": None, "confidence": "error", "error": str(exc)}
+            log.warning("Region %d: CRC convention detection failed: %s", region_idx, exc)
+        (rdir / "headers" / "crc_convention.json").write_text(json.dumps(crc_conv, indent=2))
+        if crc_conv.get("convention"):
+            log.info("Region %d CRC convention: %s (%s; EC %d/%d, VID %d/%d votes)",
+                     region_idx, crc_conv["convention"], crc_conv["confidence"],
+                     crc_conv["details"]["ec"][crc_conv["convention"]],
+                     crc_conv["details"]["ec"]["checked"],
+                     crc_conv["details"]["vid"][crc_conv["convention"]],
+                     crc_conv["details"]["vid"]["checked"])
+        else:
+            log.warning("Region %d: CRC convention undetermined — repacker will "
+                        "re-detect at repack time", region_idx)
+
         leb_map = self._build_leb_map(region)
         seen_hashes: Dict[str, str] = {}  # sha256 -> primary volume name (for dedup)
         for vol_id, vol_info in sorted(region.volumes.items()):
             self._extract_volume(vol_id, vol_info, leb_map, rdir, region, seen_hashes, warnings_list)
+
+    # ── CRC-convention detection (v1.8.0) ────────────────────────────────────
+    # Detect which CRC convention the ORIGINAL image uses (plain crc32 vs
+    # vendor-inverted ~crc32) by voting over its stored EC/VID header CRCs.
+    # Persisted per region so the repacker recomputes any CRC with the SAME
+    # formula the vendor used instead of a hard-coded one.
+    def _detect_crc_convention(self, ec_headers, vid_headers, region_data: bytes,
+                               base_offset: int = 0) -> dict:
+        votes = {"crc32": 0, "~crc32": 0}
+        details = {
+            "ec":  {"checked": 0, "crc32": 0, "~crc32": 0},
+            "vid": {"checked": 0, "crc32": 0, "~crc32": 0},
+        }
+        # Header offsets in the JSON are absolute into the whole firmware
+        # image; normalize by base_offset to index into the region slice.
+        for h in ec_headers:
+            off = h.offset - base_offset
+            if off < 0 or off + 64 > len(region_data): continue
+            stored = h.hdr_crc
+            if stored in (0, 0xFFFFFFFF): continue
+            base = zlib.crc32(region_data[off:off + 60]) & 0xFFFFFFFF
+            details["ec"]["checked"] += 1
+            for name, c in (("crc32", base), ("~crc32", ~base & 0xFFFFFFFF)):
+                if c == stored:
+                    votes[name] += 1
+                    details["ec"][name] += 1
+                    break
+        for v in vid_headers:
+            off = v.offset - base_offset
+            if off < 0 or off + 64 > len(region_data): continue
+            stored = v.hdr_crc
+            if stored in (0, 0xFFFFFFFF): continue
+            base = zlib.crc32(region_data[off:off + 60]) & 0xFFFFFFFF
+            details["vid"]["checked"] += 1
+            for name, c in (("crc32", base), ("~crc32", ~base & 0xFFFFFFFF)):
+                if c == stored:
+                    votes[name] += 1
+                    details["vid"][name] += 1
+                    break
+        total = votes["crc32"] + votes["~crc32"]
+        if total == 0:
+            winner, confidence = None, "none"
+        elif votes["crc32"] == 0 or votes["~crc32"] == 0:
+            winner = max(votes.items(), key=lambda kv: kv[1])[0]
+            confidence = "unanimous"
+        else:
+            winner = max(votes.items(), key=lambda kv: kv[1])[0]
+            confidence = "majority"
+        return {
+            "convention": winner,
+            "confidence": confidence,
+            "votes": votes,
+            "details": details,
+            "note": ("crc32 = zlib.crc32(data) over the 60 header bytes; "
+                     "~crc32 = bitwise NOT of that (== kernel crc32_le(0xFFFFFFFF,..) "
+                     "with no final inversion). Detected from the ORIGINAL image's "
+                     "stored header CRCs at analysis time; the repacker uses this "
+                     "convention for every CRC it recomputes."),
+        }
 
     def _build_leb_map(self, region: UBIRegion) -> Dict[int, Dict[int, bytes]]:
         leb_map: Dict[int, Dict[int, bytes]] = {}

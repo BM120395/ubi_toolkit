@@ -8,7 +8,7 @@ and installed via ``uv tool install .`` or ``pip install .``.
 
 from __future__ import annotations
 
-__version__ = "1.6.0"
+__version__ = "1.9.0"
 
 # Operations exposed by the unified CLI.
 OPERATIONS = ("analyze", "extract", "repack", "compare", "verify", "self-test")

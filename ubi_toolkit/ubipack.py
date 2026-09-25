@@ -66,7 +66,7 @@ def write_sidecar(analysis_dir: Path, source: Path, extra: Optional[dict] = None
         "schema_version": METADATA_SCHEMA_VERSION,
         "source_image": str(source.resolve()),
         "source_sha256": _sha256_file(source) if source.exists() else None,
-        "ubipack_version": "1.1.0",
+        "ubipack_version": "1.9.0",
     }
     if extra:
         sidecar.update(extra)
@@ -699,7 +699,7 @@ Examples:
     p.add_argument("-v", "--verbose", action="store_true",
                    help="Enable DEBUG logging")
     p.add_argument("--version", action="version",
-                   version="ubipack 1.6.0")
+                   version="ubipack 1.9.0")
     return p
 
 
