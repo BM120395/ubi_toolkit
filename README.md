@@ -1,5 +1,15 @@
 # ubipack — UBI Firmware Analysis & Surgical Repacking Toolkit
 
+> **v1.10.1** — repack fixes found in real use: **mirror-copy volumes**
+> (vendor regions that carry the same volume twice, byte-identical) no longer
+> abort repack with `E_AMBIGUOUS_MAPPING` — identical copy groups collapse to
+> one canonical LEB set and **every copy is patched identically** (UBI picks
+> the highest-sqnum claimant at runtime); divergent duplicates still error.
+> The roundtrip gate now accepts an extracted volume that carries `--auto-fix`
+> single-bit repairs the region does not have (long multi-bit runs still
+> fail). Repack help examples: full recover → modify → repack sequence, and
+> `-n` documented as the analysis dir (not the output dir).
+>
 > **v1.10.0** — donor-based recovery, made honest. The anomaly pre-scan now
 > runs on **every** analyze: an ECC-interleaved dump analyzed without
 > `--auto-fix` exits 3 with the exact rerun hint instead of silently
@@ -208,9 +218,18 @@ ubipack -a -s firmware.bin -o analysis_out/ \
     --force-geometry --page-size 0x800 --oob-size 0x40 --peb-size 0x20000
 
 # Surgical replace of one volume inside an analyzed clean UBI region
+# -n = the ANALYSIS directory (holds ubi/region_0/clean_ubi.img),
+#     NOT the repack output; -o = where the repacked images go
 ubipack -r -n analysis_out/ \
     --replace region0:rootfs=/path/new_rootfs.squashfs \
     -o repacked/
+
+# Full recover -> modify -> repack sequence
+ubipack -a -s dump.bin -o out/ --auto-fix --reference sysupgrade.bin
+# ... modify out/ubi/region_0/volumes/vol_0_squashfs.squashfs ...
+ubipack -r -n out/ \
+    --replace region0:squashfs=out/ubi/region_0/volumes/vol_0_squashfs_mod.squashfs \
+    -o repacked/ --yes
 
 # Preflight (validate capacities without writing)
 ubipack -r -n analysis_out/ \

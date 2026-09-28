@@ -630,8 +630,18 @@ Examples:
   ubipack -x -s firmware.bin -o analysis_out/
 
   # Surgical replace of a single volume inside a clean UBI region
+  # -n = the ANALYSIS directory (the one with ubi/region_0/clean_ubi.img),
+  #     NOT the output directory; -o = where the repacked images go
   ubipack -r repack -n analysis_out/ \
       --replace region0:rootfs=/path/new_rootfs.squashfs -o repacked/
+
+  # Full real-world sequence: recover a dump, modify its fs, repack
+  ubipack -a analyze -s dump.bin -o out/ --auto-fix \
+      --reference sysupgrade.bin          # byte-exact recovery
+  # ... edit out/ubi/region_0/volumes/vol_0_squashfs.squashfs ...
+  ubipack -r -n out/ \
+      --replace region0:squashfs=out/ubi/region_0/volumes/vol_0_squashfs_mod.squashfs \
+      -o repacked/ --yes
 
   # Preflight only (no write)
   ubipack -r repack -n analysis_out/ \
@@ -685,9 +695,12 @@ Examples:
     p.add_argument("-s", "--source", dest="firmware",
                    help="Input firmware binary (for analyze/extract)")
     p.add_argument("-o", "--output", dest="output", default="output",
-                   help="Output directory or comparison report path")
+                   help="Output directory or comparison report path "
+                        "(repack: where repacked images are written)")
     p.add_argument("-n", "--analysis-dir", dest="analysis_dir",
-                   help="Existing ubipack analysis directory (for repack/verify)")
+                   help="Existing ubipack ANALYSIS directory (for repack/"
+                        "verify): the one containing ubi/region_N/"
+                        "clean_ubi.img — NOT the repack output directory")
 
     # Geometry (forwarded to analyst)
     p.add_argument("--page-size", type=lambda x: int(x, 0),
@@ -754,7 +767,7 @@ Examples:
     p.add_argument("-v", "--verbose", action="store_true",
                    help="Enable DEBUG logging")
     p.add_argument("--version", action="version",
-                   version="ubipack 1.10.0")
+                   version="ubipack 1.10.1")
     return p
 
 
