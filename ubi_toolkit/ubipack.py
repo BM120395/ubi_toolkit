@@ -187,9 +187,20 @@ def _run_analyst(firmware: Path, output: Path, args: argparse.Namespace) -> int:
     return 0
 
 
-def _patch_volumes_with_reference(out: Path, ref: bytes, verbose: bool) -> None:
+def _patch_volumes_with_reference(out: Path, ref: bytes, verbose: bool,
+                                  restore: bool = False) -> None:
     """v1.3.0: patch extracted volume images against a volume-level
-    reference (evidence-gated: only isolated single-bit rot is repaired)."""
+    reference (evidence-gated: only isolated single-bit rot is repaired).
+
+    v1.10.0: --restore-reference upgrades this to a canonical donor
+    restore. When the donor is trustworthy (a vendor sysupgrade package or
+    a known-good volume), structural differences are not necessarily rot —
+    e.g. ECC-interleaved LEBs reassembled without the layout fix, LEB
+    reordering, or an fs-version mismatch — so the honest repair is to
+    restore the donor's bytes verbatim and size-clamp to the local
+    volume. Single-bit rot (the ANOM-2 evidence gate) still repairs
+    in place byte-by-byte; restore mode additionally lays the donor over
+    the local volume without demanding the rot signature."""
     from ubi_toolkit.anomaly import bitrot_signature, repair_bitrot
     vols = sorted(p for p in out.glob("ubi/region_*/volumes/*") if p.is_file())
     if not vols:
@@ -202,10 +213,21 @@ def _patch_volumes_with_reference(out: Path, ref: bytes, verbose: bool) -> None:
             print(f"[AUTO-FIX] {v.name}: already matches reference")
             continue
         if not sig["is_bitrot"]:
-            if verbose:
+            if restore:
+                n = min(len(data), len(ref))
+                buf = bytearray(data)
+                buf[:n] = ref[:n]
+                v.write_bytes(bytes(buf))
+                print(f"[AUTO-FIX] {v.name}: restored from reference "
+                      f"({sig['diff_bytes']} bytes"
+                      + (", scan capped" if sig.get("capped") else "")
+                      + f", max run {sig['max_run']}) -> {v} "
+                      f"[donor-trusted restore: verify structurally "
+                      f"before flashing]")
+            elif verbose:
                 print(f"[AUTO-FIX] {v.name}: differences vs reference are "
                       f"not bit rot ({sig['diff_bytes']} bytes, max run "
-                      f"{sig['max_run']}) — skipped")
+                      f"{sig['max_run']}) — skipped (restore mode off)")
             continue
         buf = bytearray(data)
         repaired, multi = repair_bitrot(buf, ref)
@@ -274,6 +296,10 @@ def op_analyze(args: argparse.Namespace) -> int:
     # Anomaly pre-scan (v1.2.0): read-only, cheap, runs before the parse.
     # Repairable findings fail fast (exit 3) with a rerun hint unless
     # --auto-fix was given; --reference enables the bit-rot (ANOM-2) check.
+    # v1.10.0: the pre-scan runs on EVERY analyze. Plain analyses of
+    # ECC-interleaved dumps used to extract silently-shifted volumes
+    # (real-world case: output volumes 10% multi-bit vs the donor, i.e.
+    # corrupt) — now ANOM-1 fail-fasts with the exact rerun hint.
     reference_bytes: Optional[bytes] = None
     reference_volume: Optional[bytes] = None
     if getattr(args, "reference", None):
@@ -287,7 +313,8 @@ def op_analyze(args: argparse.Namespace) -> int:
             print(f"[REFERENCE] UBI image detected — extracted clean "
                   f"volume ({len(reference_volume):,} B) from it for "
                   f"adjudication/patching")
-    if getattr(args, "auto_fix", False) or reference_bytes is not None:
+    if True:  # v1.10.0: pre-scan is unconditional; the gates below decide
+              # whether findings stop the run or repairs are applied.
         from ubi_toolkit.anomaly import (
             apply_repairs,
             fail_fast_message,
@@ -310,6 +337,13 @@ def op_analyze(args: argparse.Namespace) -> int:
                 print(f"[AUTO-FIX] {a}")
             if args.dry_run:
                 return 0
+            if ctx.reference is None and ctx.page_layout is not None:
+                print("[AUTO-FIX] note: no --reference given — layout was "
+                      "adjudicated from the image's own squashfs metadata; "
+                      "residual single-bit rot may remain in extracted "
+                      "volumes. For byte-exact extraction, rerun with "
+                      "--reference DONOR (a sysupgrade image or known-good "
+                      "volume both work).")
             if repaired != fw.read_bytes():
                 fixed_path = fw.with_suffix(".autofix.bin")
                 fixed_path.write_bytes(repaired)
@@ -347,8 +381,11 @@ def op_analyze(args: argparse.Namespace) -> int:
         return rc
     # v1.3.0: volume-level reference patches the extracted volumes
     # (evidence-gated single-bit rot repair, post-extraction).
+    # v1.10.0: --restore-reference additionally canonicalizes non-bit-rot
+    # differences from the donor (see _patch_volumes_with_reference).
     if reference_volume is not None and not args.dry_run:
-        _patch_volumes_with_reference(out, reference_volume, args.verbose)
+        _patch_volumes_with_reference(out, reference_volume, args.verbose,
+                                      restore=args.restore_reference)
     # v1.5.0: boot-image discovery (uImage/FIT). When --auto-fix applied a
     # page layout, `fw` already points at the stripped image (flag set
     # above); otherwise scan the raw image. Catches kernel/U-Boot/DTB
@@ -605,6 +642,15 @@ Examples:
 
   # Verify integrity of a previously-produced analysis
   ubipack -V verify -n analysis_out/
+
+  # Byte-exact recovery of an ECC-interleaved dump with a trusted donor
+  # (a sysupgrade package, full image, or bare volume all work)
+  ubipack -a analyze -s dump.bin -o out/ --auto-fix \
+      --reference sysupgrade.bin
+
+  # Same, plus verbatim donor restore when volumes differ beyond bit rot
+  ubipack -a analyze -s dump.bin -o out/ --auto-fix \
+      --reference donor_volume.squashfs --restore-reference
 """)
     mode = p.add_mutually_exclusive_group(required=True)
     mode.add_argument("-a", "--analyze", dest="op_analyze", action="store_true",
@@ -668,7 +714,16 @@ Examples:
                         "with a rerun hint")
     p.add_argument("--reference", dest="reference",
                    help="Known-good image for bit-rot detection/repair "
-                        "(enables ANOM-2 evidence)")
+                        "(enables ANOM-2 evidence). May be a full image, a "
+                        "volume, or a vendor sysupgrade package")
+    p.add_argument("--restore-reference", dest="restore_reference",
+                   action="store_true",
+                   help="Analyze with --reference: when extracted volumes "
+                        "differ from the donor beyond single-bit rot "
+                        "(layout/reassembly/version drift), restore the "
+                        "donor's bytes verbatim instead of skipping. The "
+                        "donor is trusted as-is; verify structurally "
+                        "before flashing")
 
     # Repack-specific
     p.add_argument("--replace", action="append",
@@ -699,7 +754,7 @@ Examples:
     p.add_argument("-v", "--verbose", action="store_true",
                    help="Enable DEBUG logging")
     p.add_argument("--version", action="version",
-                   version="ubipack 1.9.0")
+                   version="ubipack 1.10.0")
     return p
 
 

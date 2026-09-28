@@ -1,14 +1,20 @@
 # ubipack — UBI Firmware Analysis & Surgical Repacking Toolkit
 
-> **v1.3.0** — new in this iteration: volume-level `--reference`. Pass a
-> known-good **volume** image (e.g. the FS image extracted from a sibling
-> dump) and the pre-scan adjudicates the inline-ECC page layout by content
-> matching (LEB prefixes must appear verbatim in the reference), then
-> patches the extracted volumes against it (isolated single-bit rot only —
-> evidence-gated, never blind). Size-matched references keep the existing
-> whole-image bit-rot behavior. Also new: `strip_page_layout()` — with
-> `--auto-fix`, an adjudicated layout is applied to the image
-> (`<input>.layout.bin`) before analysis.
+> **v1.10.0** — donor-based recovery, made honest. The anomaly pre-scan now
+> runs on **every** analyze: an ECC-interleaved dump analyzed without
+> `--auto-fix` exits 3 with the exact rerun hint instead of silently
+> extracting page-shifted (corrupt) volumes. `--reference` accepts a full
+> image, a volume, **or a vendor sysupgrade package** (its clean volume is
+> extracted automatically). New `--restore-reference`: when an extracted
+> volume differs from the trusted donor beyond single-bit rot (layout/
+> reassembly/version drift), the donor's bytes are restored verbatim
+> (size-clamped) instead of skipped. Reference-free `--auto-fix` still
+> works (layout self-adjudicated from the image's own xz-checksummed
+> metadata) but now prints an explicit note that residual single-bit rot
+> may remain — donor references give byte-exact output.
+>
+> **v1.3.0** — volume-level `--reference` (layout adjudication by content
+> matching + extracted-volume patching) and `strip_page_layout()`.
 >
 > **v1.2.0** — `ubi_toolkit/anomaly.py` and
 > `ubipack --auto-fix/--reference` — a fail-fast anomaly pre-scan (exit 3 with
@@ -185,8 +191,11 @@ One operation per invocation, selected by a single short flag (sqpack style):
 | `-t` | `self-test`  | Toolchain availability + submodule import sanity        |
 
 Lifecycle (v1.6.0): `-I/--install` · `-U/--uninstall` · `--upgrade` ·
-`-K/--clean PATH` — see *Installation, Option A*. Anomaly pre-scan runs on
-every analyze: `--auto-fix` (+ `--reference KNOWN_GOOD` for bit-rot repair).
+`-K/--clean PATH` — see *Installation, Option A*. The anomaly pre-scan runs
+on every analyze. Repairable anomalies fail fast (exit 3) unless
+`--auto-fix` is given; `--reference KNOWN_GOOD` enables bit-rot evidence
+(image, volume, or vendor sysupgrade package) and `--restore-reference`
+canonicalizes extracted volumes from the trusted donor.
 
 ## Examples
 
@@ -216,8 +225,20 @@ ubipack -r -n analysis_out/ \
 # Compare two analyses (e.g. before vs after firmware mod)
 ubipack -c --left before/ --right after/ -o diff.json
 
-# Re-verify integrity of a previous analysis
+# Verify integrity of a previously-produced analysis
 ubipack -V -n analysis_out/
+
+# Reference-free recovery of an ECC-interleaved dump (layout self-adjudicated;
+# prints a note that residual single-bit rot may remain)
+ubipack -a -s dump.bin -o out/ --auto-fix
+
+# Byte-exact recovery with a trusted donor (full image, volume, or vendor
+# sysupgrade package all work); --restore-reference additionally restores
+# donor bytes verbatim when differences go beyond single-bit rot
+ubipack -a -s dump.bin -o out/ --auto-fix \
+    --reference sysupgrade.bin
+ubipack -a -s dump.bin -o out/ --auto-fix \
+    --reference donor_volume.squashfs --restore-reference
 
 # Sanity-check your toolchain
 ubipack -t
