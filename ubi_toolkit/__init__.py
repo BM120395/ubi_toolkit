@@ -8,10 +8,10 @@ and installed via ``uv tool install .`` or ``pip install .``.
 
 from __future__ import annotations
 
-__version__ = "1.10.1"
+__version__ = "1.13.0"
 
 # Operations exposed by the unified CLI.
-OPERATIONS = ("analyze", "extract", "repack", "compare", "verify", "self-test")
+OPERATIONS = ("analyze", "extract", "repack", "splice", "carve", "compare", "verify", "self-test")
 
 # Sidecar metadata schema. Stored next to an analysis directory so the tool can
 # auto-detect which firmware an extraction was produced from.

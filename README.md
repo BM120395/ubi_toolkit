@@ -1,5 +1,49 @@
 # ubipack — UBI Firmware Analysis & Surgical Repacking Toolkit
 
+> **v1.13.0** — **assumption-free geometry**: every value (page, OOB, PEB,
+> VID offset, LEB) is derived from the image and forensically cross-verified
+> at run time — nothing is fixed a priori. Highlights:
+> - duplicate-EC-header dedupe (vendor redundant page writes no longer
+>   shatter PEB detection into thousands of micro-regions)
+> - dynamic candidate-geometry synthesis (raw-EB decomposition catches
+>   exotic layouts beyond the standard NAND table)
+> - geometry cross-verification with confidence verdict (EC CRCs + VID
+>   placement at the declared offset)
+> - VID-header offset probing from image evidence (declared ≠ observed)
+> - attach-aware region grouping (new layout-volume boundaries + physical
+>   gaps; image_seq no longer splits volumes that span banks)
+> - stride-aliased tie-breaks: global VID-alignment score, global FF-density,
+>   UBIFS FS-content decisive tier
+> - propagate resolved VID offset into region carving and LEB assembly
+> - usage guide: `ubi_toolkit/USAGE.md`
+>
+> **v1.12.0** — ubipack gets smart about extraction quality and anomaly
+> duality. **`--carve`**: raw NAND/UBI flash dump → SquashFS volume, with
+> full anomaly detection (OOB interleave strip, wear detection, bit-flipped
+> VID lnum cross-check, redundant-copy scoring, gap detection — all
+> resolved, none silently ignored). **Post-extraction health gate**: every
+> extracted filesystem is deep-checked — **SquashFS, JFFS2, CramFS, UBIFS,
+> DTB, uImage kernels, gzip/xz/cpio initramfs** — via format-specific
+> structural walks (metadata chains, node CRCs, device-tree tokens, image
+> CRCs), not just magic-number sniffing. A damaged volume triggers
+> evidence-gated healing from alternative LEB assemblies (physical PEB
+> order vs logical lnum order), the healthiest wins, and pre-heal bytes
+> are kept as `<volume>.orig.<ext>`.
+> **`--dual-output` repack**: build **two** UBI images — one with the
+> anomaly **fixed**, one preserving the original anomaly **verbatim**.
+>
+> **v1.11.0** — new `--splice` operation: write repacked regions **back into
+> the original interleaved dump**. ubipack could recover an ECC-interleaved
+> dump and surgically repack a volume, but the repacked clean image had no
+> page-faithful path back into the raw dump (the vendor upgrader re-derives
+> ECC; a chip programmer needs the interleaved page bytes). `--splice`
+> re-derives the page layout from the dump, replaces only the FS slices of
+> changed pages from the repacked image, and **carries every non-FS slice
+> (inline ECC, OOB-rescue bytes) over verbatim** — bit-faithful page
+> geometry, untouched bytes everywhere else. Internally verified end-to-end:
+> deinterleaving the spliced dump reproduces the repacked region byte-exact,
+> and re-analyzing it re-extracts the repacked volume byte-exact.
+>
 > **v1.10.1** — repack fixes found in real use: **mirror-copy volumes**
 > (vendor regions that carry the same volume twice, byte-identical) no longer
 > abort repack with `E_AMBIGUOUS_MAPPING` — identical copy groups collapse to
@@ -196,6 +240,8 @@ One operation per invocation, selected by a single short flag (sqpack style):
 | `-a` | `analyze`    | Scan firmware, detect NAND geometry, extract UBI regions|
 | `-x` | `extract`    | Alias for `analyze` (always writes extraction)          |
 | `-r` | `repack`     | Surgical clean-UBI replace of one or more volumes       |
+| `--splice` | `splice` | Write repacked regions back into the original dump (v1.11.0) |
+| `--carve` | `carve`   | Raw NAND/UBI dump → SquashFS volume with anomaly resolution (v1.12.0) |
 | `-c` | `compare`    | Compare two analysis directories                        |
 | `-V` | `verify`     | Re-audit analysis output (VID CRC + EC magic/CRC)       |
 | `-t` | `self-test`  | Toolchain availability + submodule import sanity        |
@@ -206,6 +252,34 @@ on every analyze. Repairable anomalies fail fast (exit 3) unless
 `--auto-fix` is given; `--reference KNOWN_GOOD` enables bit-rot evidence
 (image, volume, or vendor sysupgrade package) and `--restore-reference`
 canonicalizes extracted volumes from the trusted donor.
+
+### Extraction health gate (v1.12.0)
+
+Every extracted filesystem is deep-checked after extraction, with a
+format-specific structural walker:
+
+| Format | Deep check |
+|--------|-----------|
+| SquashFS | superblock pointers, inode/dir metadata chains, root inode, fragment table |
+| JFFS2 | node chain: magic, totlen, header CRCs, erased-space runs |
+| CramFS | superblock fields, block/file counts, image CRC |
+| UBIFS | node chain: magic, CRC (both conventions), length/alignment walk, SB node presence |
+| DTB | header fields, token-level dt_struct walk, node nesting balance |
+| uImage | header CRC + payload CRC (bounded) |
+| initramfs | compression wrapper (gzip/xz decoded; zstd/bzip2/lz4 header-level), cpio newc entry walk |
+
+If the structural walk finds damage, ubipack automatically attempts
+healing from alternative LEB assemblies (physical PEB order vs logical
+order), keeps the healthiest, and records the repair in the analysis
+tree. Outcomes appear as `[FS-CHECK]` / `[FS-HEAL]` log lines. Pre-heal
+bytes are kept as `<volume>.orig.<ext>` and listed in
+`.heal_report.json`, so `repack --dual-output` can build the
+anomaly-preserving image. uImage/FIT boot images found outside the UBI
+region are deep-checked too (`[BOOT-IMG] ... health=`).
+
+The intended division of labor: **ubipack fixes UBI-level anomalies and
+extracts a proper filesystem; sqpack then unpacks/repacks that
+filesystem.**
 
 ## Examples
 
@@ -259,6 +333,15 @@ ubipack -a -s dump.bin -o out/ --auto-fix \
 ubipack -a -s dump.bin -o out/ --auto-fix \
     --reference donor_volume.squashfs --restore-reference
 
+# Write the repacked regions back into the ORIGINAL interleaved dump
+# (v1.11.0 --splice; the last step of recover -> modify -> repack -> write)
+# Only FS slices of changed pages are replaced; every non-FS slice
+# (inline ECC, OOB-rescue bytes) is carried over verbatim, so page
+# geometry stays bit-faithful for chip programmers. Layout is re-derived
+# from the dump itself and cross-checked against -n before writing.
+ubipack --splice -s firmware.bin -n out/ --repacked repacked/ \
+    -o firmware.spliced.bin
+
 # Sanity-check your toolchain
 ubipack -t
 ```
@@ -276,6 +359,7 @@ ubi_toolkit/
     ├── ubipack.py         # unified CLI dispatcher
     ├── analyst.py         # UBI region detection + extract
     ├── repacker.py        # Surgical volume replacement
+    ├── splice.py          # Page-faithful dump write-back (--splice, v1.11.0)
     ├── ecc_runtime.py     # NAND ECC layout handling
     ├── anomaly.py         # anomaly engine (ANOM-1..5) + --auto-fix
     ├── bootimg.py         # uImage / FIT payload extraction

@@ -27,23 +27,13 @@ import argparse
 import hashlib
 import json
 import logging
-import os
 import struct
-import subprocess
 import sys
 import time
 import zlib
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-
-# Optional GUI
-try:
-    import tkinter as tk
-    from tkinter import filedialog, messagebox, ttk
-    HAS_TK = True
-except Exception:
-    HAS_TK = False
 
 # Optional progress bar
 try:
@@ -109,7 +99,7 @@ FS_SCAN_SIGNATURES = [
     (b"sqsh", "SquashFS", "big", 4096, "SquashFS v4 BE"),
     (b"qshs", "SquashFS", "mixed", 4096, "SquashFS v4 mixed-endian"),
     (b"shsq", "SquashFS", "mixed", 4096, "SquashFS v4 mixed-endian"),
-    (b"\x31\x18\x55\x28", "UBIFS", "little", 4096, "UBIFS LE"),
+    (b"\x31\x18\x10\x06", "UBIFS", "little", 4096, "UBIFS LE"),
     (b"\x85\x19\x03\xE0", "JFFS2", "little", 128, "JFFS2 LE"),
     (b"\x19\x85\xE0\x03", "JFFS2", "big", 128, "JFFS2 BE"),
     (b"\x45\x3D\xCD\x28", "CramFS", "little", 4096, "CramFS LE"),
@@ -183,6 +173,8 @@ class VolumeInfo:
     extracted_path: Optional[str] = None
     size_bytes: int = 0  # logical_span_with_ff_filled_missing_lnums
     validation: Optional[dict] = None
+    deep_health: Optional[dict] = None   # v1.12.0: fs_health deep-check result
+    healed_from: Optional[str] = None    # v1.12.0: heal variant name, if healed
     present_leb_count: int = 0
     max_lnum: int = -1
     logical_leb_count: int = 0
@@ -217,8 +209,8 @@ class UBIRegion:
     peb_size_raw: Optional[int] = None
     
     offset_space: str = "clean_oob_stripped"
-    region_type: str = "image_seq_group"
-    grouping_reason: str = "contiguous EC headers grouped by gap threshold and image_seq"
+    region_type: str = "ubi_attach_group"
+    grouping_reason: str = "new-attach (layout vol) boundaries and >4-PEB gaps"
 
 
 @dataclass
@@ -290,11 +282,13 @@ class FsValidator:
     @staticmethod
     def validate_squashfs(data: bytes, offset: int = 0) -> dict:
         result: dict = {"valid": False, "reason": "", "meta": {}, "errors": []}
-        chunk = data[offset:]
-        if len(chunk) < 96:
+        # zero-copy: the orphan scan calls this per magic hit on
+        # multi-hundred-MB images — a slice here copies ~image_size per hit
+        if len(data) < offset + 96:
             result["reason"] = "Too small for SquashFS superblock"
             return result
-        magic = chunk[:4]
+        chunk = memoryview(data)[offset:]
+        magic = bytes(chunk[:4])
         if magic not in (b"hsqs", b"sqsh", b"qshs", b"shsq"):
             result["reason"] = f"Unknown magic: {magic.hex()}"
             return result
@@ -339,8 +333,8 @@ class FsValidator:
     @staticmethod
     def validate_jffs2(data: bytes, offset: int = 0) -> dict:
         result: dict = {"valid": False, "reason": "", "meta": {}, "errors": []}
-        chunk = data[offset:]
-        if len(chunk) < 16: return result
+        if len(data) < offset + 16: return result
+        chunk = memoryview(data)[offset:]
         # JFFS2 magic is 2 bytes (0x1985); node type is next 2 bytes and varies
         magic2 = chunk[:2]
         if magic2 not in (b"\x85\x19", b"\x19\x85"): return result
@@ -365,8 +359,8 @@ class FsValidator:
     @staticmethod
     def validate_cramfs(data: bytes, offset: int = 0) -> dict:
         result: dict = {"valid": False, "reason": "", "meta": {}, "errors": []}
-        chunk = data[offset:]
-        if len(chunk) < 128: return result
+        if len(data) < offset + 128: return result
+        chunk = memoryview(data)[offset:]
         magic = chunk[:4]
         if magic not in (b"\x45\x3D\xCD\x28", b"\x28\xCD\x3D\x45"): return result
         le = magic == b"\x45\x3D\xCD\x28"
@@ -388,12 +382,20 @@ class FsValidator:
     @staticmethod
     def validate_ubifs(data: bytes, offset: int = 0) -> dict:
         result: dict = {"valid": False, "reason": "", "meta": {}, "errors": []}
-        chunk = data[offset:]
-        if len(chunk) < 80: return result
-        if chunk[:4] != b"\x31\x18\x55\x28": return result
+        # bounds check only — never slice `data` here: the orphan scan calls
+        # this per magic hit on multi-hundred-MB images, and a slice would
+        # copy ~image_size bytes per hit.
+        if len(data) < offset + 80: return result
+        if data[offset:offset + 4] != b"\x31\x18\x10\x06": return result
         try:
-            leb_size = struct.unpack_from("<I", chunk, 0x18)[0]
-            leb_count = struct.unpack_from("<I", chunk, 0x1C)[0]
+            # the SB node's common-header node_type byte must be 5; reject
+            # every other UBIFS node type before reading further
+            if data[offset + 20] != 5:
+                return result
+            # ubifs_sb_node: ubifs_ch (24 B) + padding[10] + key_fmt +
+            # padding2[5] + min_io_size@40, leb_size@44, leb_count@48
+            leb_size = struct.unpack_from("<I", data, offset + 44)[0]
+            leb_count = struct.unpack_from("<I", data, offset + 48)[0]
             meta = {"leb_size": leb_size, "leb_count": leb_count}
             errors = []
             if leb_size <= 0 or leb_size > 4 * 1024 * 1024: errors.append(f"Suspicious LEB size: {leb_size}")
@@ -410,8 +412,8 @@ class FsValidator:
     @staticmethod
     def validate_dtb(data: bytes, offset: int = 0) -> dict:
         result: dict = {"valid": False, "reason": "", "meta": {}, "errors": []}
-        chunk = data[offset:]
-        if len(chunk) < 40: return result
+        if len(data) < offset + 40: return result
+        chunk = memoryview(data)[offset:]
         if chunk[:4] != b"\xD0\x0D\xFE\xED": return result
         try:
             total_size = struct.unpack_from(">I", chunk, 4)[0]
@@ -443,7 +445,7 @@ class FilesystemDetector:
     FS_MAGICS = {
         b"hsqs": ("SquashFS", "little"),
         b"sqsh": ("SquashFS", "big"),
-        b"\x31\x18\x55\x28": ("UBIFS", "little"),
+        b"\x31\x18\x10\x06": ("UBIFS", "little"),
         b"\x85\x19": ("JFFS2", "little"),  # 2-byte magic only; node type varies
         b"\x19\x85": ("JFFS2", "big"),     # 2-byte magic only; node type varies
         b"\x45\x3D\xCD\x28": ("CramFS", "little"),
@@ -453,8 +455,11 @@ class FilesystemDetector:
 
     @staticmethod
     def detect(data: bytes) -> Tuple[Optional[str], Optional[str], dict]:
-        stripped = data.lstrip(b"\xff")
-        if not stripped: return None, None, {}
+        # probe only the leading bytes — data can be a huge volume blob and
+        # lstrip() would copy it wholesale
+        lead = data[:4096]
+        stripped = lead.lstrip(b"\xff")
+        if not stripped or len(stripped) < 8: return None, None, {}
         for magic, (fs_type, endian) in FilesystemDetector.FS_MAGICS.items():
             if stripped[:len(magic)] == magic:
                 return fs_type, endian, {}
@@ -471,13 +476,152 @@ class OOBDetector:
         self.forced_page = forced_page
         self.forced_oob = forced_oob
 
+    def _robust_raw_eb(self, f1: int) -> Optional[int]:
+        """Dedupe-aware raw-EB estimation.
+
+        Some vendors write every EC header TWICE a few KiB apart (redundant
+        page writes). Taking the gap between the first two magics then yields
+        the duplicate interval, not the PEB size, which cascades into bogus
+        OOB geometry, negative LEB sizes and thousands of micro-regions.
+        Instead: collect CRC-valid EC headers, drop byte-identical duplicates
+        within a 4 KiB window, and return the modal stride. Returns None when
+        fewer than two CRC-valid headers exist (caller falls back to legacy).
+        """
+        try:
+            offs, pos = [], f1
+            # Converge early: once the deduped gap (excluding redundant vendor
+            # copies) has repeated K times consecutively, the estimate is
+            # stable — no fixed hunt window needed.
+            lead, lead_runs, K = None, 0, 8
+            dedup = []
+            while pos < len(self.data) and len(offs) < 512:
+                idx = self.data.find(UBI_EC_MAGIC, pos)
+                if idx < 0: break
+                ok, _conv = ECHeader._verify(self.data, idx)
+                pos = idx + 4
+                if not ok:
+                    continue
+                offs.append(idx)
+                # incremental dedupe: skip redundant vendor copies
+                if dedup and idx - dedup[-1] < 0x1000 and \
+                   self.data[idx:idx + 64] == self.data[dedup[-1]:dedup[-1] + 64]:
+                    continue
+                dedup.append(idx)
+                if len(dedup) >= 2:
+                    gap = dedup[-1] - dedup[-2]
+                    if gap == lead:
+                        lead_runs += 1
+                    else:
+                        lead, lead_runs = gap, 1
+                    if lead_runs >= K and len(dedup) >= 12:
+                        break  # converged
+            if len(dedup) < 2: return None
+            gaps = [b - a for a, b in zip(dedup, dedup[1:])]
+            return max(set(gaps), key=gaps.count)
+        except Exception as exc:
+            log.debug("robust raw_eb estimation failed: %s", exc)
+            return None
+
+    def _candidate_geometries(self, raw_eb: int) -> list:
+        """Derive ALL plausible (page, oob, stride, pages, clean_eb) tuples
+        from the observed raw erase-block size — no fixed assumption.
+
+        Two sources are merged:
+          1. the standard NAND geometry table (fast path for common flashes)
+          2. synthetic decomposition: for every power-of-two page count,
+             stride = raw_eb / pages; every power-of-two page dividing the
+             stride yields a candidate with oob = stride - page, provided
+             0 < oob <= page/2 (vendor-realistic spare-area sizing).
+        This catches exotic geometries absent from the table."""
+        cands = set()
+        for page_size, oob_size in NAND_GEOMETRIES:
+            stride = page_size + oob_size
+            if raw_eb % stride == 0:
+                pages = raw_eb // stride
+                cands.add((page_size, oob_size, stride, pages, pages * page_size))
+        for pp in (2, 4, 8, 16, 32, 64, 128, 256):
+            if raw_eb % pp: continue
+            stride = raw_eb // pp
+            for page in (256, 512, 1024, 2048, 4096, 8192, 16384):
+                if stride % page == 0:
+                    oob = stride - page
+                    if 0 < oob <= page // 2:
+                        cands.add((page, oob, stride, pp, pp * page))
+        ordered = sorted(cands, key=lambda t: (t[0], t[1]))
+        if len(ordered) > 32:
+            log.warning("Candidate geometry explosion (%d) — keeping first 32", len(ordered))
+            ordered = ordered[:32]
+        return ordered
+
+    def _cross_verify_geometry(self, geom: OOBGeometry, align_off: int = 0) -> dict:
+        """Forensic self-verification of a derived geometry against the RAW
+        image, independent of how the geometry was obtained.
+
+        Evidence collected per sampled written PEB (global sampling):
+          ec_hits   : UBI# magic at clean PEB boundary 0
+          ec_crc_ok : of those, EC header CRC verifies
+          vid_hits  : UBI! magic exactly at the EC-declared vid_hdr_offset
+                      AFTER OOB stripping (only the true stride achieves this)
+          vol_pebs  : VID headers referencing real volume ids (data PEBs)
+        ECC bits themselves live inside the OOB and are vendor-formatted;
+        their correctness is reflected indirectly by the CRC/content
+        evidence above rather than by re-implementing every ECC scheme.
+        Confidence: high / medium / low."""
+        ev = {"mode": "clean_no_oob" if not geom.has_oob else "raw_oob",
+              "ec_hits": 0, "ec_crc_ok": 0, "vid_hits": 0, "vol_pebs": 0,
+              "pebs_sampled": 0, "confidence": "low"}
+        raw_eb = geom.raw_eb_size
+        if not geom.has_oob or not raw_eb:
+            ev["confidence"] = "n/a"
+            return ev
+        page, stride = geom.page_size, geom.stride
+        pos, sampled, MAX_SAMPLE = align_off, 0, 512
+        while pos + raw_eb <= len(self.data) and sampled < MAX_SAMPLE:
+            base = pos
+            pos += raw_eb
+            if self.data[base:base + 4] != UBI_EC_MAGIC:
+                continue
+            sampled += 1
+            ev["pebs_sampled"] += 1
+            ev["ec_hits"] += 1
+            ok, _ = ECHeader._verify(self.data, base)
+            if ok: ev["ec_crc_ok"] += 1
+            # vid_hdr_offset is already expressed in clean (stripped) space;
+            # map it to raw coordinates — zero-copy probe.
+            try:
+                vhf = struct.unpack_from(">I", self.data, base + 16)[0]
+            except struct.error:
+                continue
+            raw_v = base + (vhf // page) * stride + (vhf % page)
+            if raw_v + 4 <= len(self.data) and \
+               self.data[raw_v:raw_v + 4] == UBI_VID_MAGIC:
+                ev["vid_hits"] += 1
+                vol_id = struct.unpack_from(">I", self.data, raw_v + 8)[0]
+                if vol_id < 0x7FFFEFFF:
+                    ev["vol_pebs"] += 1
+        if ev["ec_hits"] >= 8:
+            ratio = ev["vid_hits"] / ev["ec_hits"]
+            ev["confidence"] = "high" if (ev["vol_pebs"] > 0 or ratio >= 0.3) \
+                else "medium"
+        log.info("Geometry cross-verification: ec=%(ec_hits)s crc_ok=%(ec_crc_ok)s "
+                 "vid@declared=%(vid_hits)s vol_pebs=%(vol_pebs)s "
+                 "sampled=%(pebs_sampled)s → confidence %(confidence)s", ev)
+        if ev["confidence"] == "low":
+            log.warning("Geometry NOT corroborated by image content — pass "
+                        "--page-size/--oob-size/--peb-size explicitly if "
+                        "extraction yields empty volumes")
+        return ev
+
     def detect(self) -> OOBGeometry:
         f1 = self.data.find(UBI_EC_MAGIC)
         f2 = self.data.find(UBI_EC_MAGIC, f1 + 1)
         if f1 < 0 or f2 < 0:
             raise ValueError("Cannot find two UBI# headers — not a UBI image?")
 
-        raw_eb = f2 - f1
+        raw_eb = self._robust_raw_eb(f1) or (f2 - f1)
+        # share with tie-break helpers (naive f2-f1 is confounded by
+        # duplicate EC copies spaced < PEB apart)
+        self._raw_eb = raw_eb
         log.info("Raw erase block size: 0x%X (%d bytes)", raw_eb, raw_eb)
 
         if self.forced_page and self.forced_oob is not None:
@@ -495,6 +639,14 @@ class OOBDetector:
             clean_eb = pages * page_size
             if clean_eb > 0 and (clean_eb & (clean_eb - 1)) == 0:
                 candidates.append((page_size, oob_size, stride, pages, clean_eb))
+        # dynamic supplement: decompose raw_eb itself (catches geometries
+        # outside the standard table — nothing is assumed a priori)
+        for cand in self._candidate_geometries(raw_eb):
+            if cand not in candidates:
+                candidates.append(cand)
+        log.info("Derived %d candidate geometry/-ies from raw EB 0x%X: %s",
+                 len(candidates), raw_eb,
+                 [(c[0], c[1]) for c in candidates])
 
         if not candidates:
             log.warning("No standard NAND geometry fits — treating as no OOB")
@@ -503,7 +655,9 @@ class OOBDetector:
         if len(candidates) == 1:
             page_size, oob_size, *_ = candidates[0]
             log.info("Auto-detected geometry: page=%dB, OOB=%dB", page_size, oob_size)
-            return self._build_geometry(page_size, oob_size, raw_eb)
+            geom = self._build_geometry(page_size, oob_size, raw_eb)
+            self._cross_verify_geometry(geom, align_off=f1)
+            return geom
 
         try:
             gen3 = self._disambiguate_geometry_gen3(candidates, f1)
@@ -521,7 +675,9 @@ class OOBDetector:
             log.warning("Gen3/Gen2 disambiguation failed (%s) — legacy _measure_stride used", exc)
             page_size, oob_size = self._measure_stride(candidates)
         log.info("Disambiguated geometry: page=%dB, OOB=%dB", page_size, oob_size)
-        return self._build_geometry(page_size, oob_size, raw_eb)
+        geom = self._build_geometry(page_size, oob_size, raw_eb)
+        self._cross_verify_geometry(geom, align_off=f1)
+        return geom
 
     def _disambiguate_geometry_gen2(self, candidates: list, first_ec_off: int) -> Optional[Tuple[int, int]]:
         """Gen2 content-evidence geometry disambiguation (additive — legacy
@@ -663,14 +819,13 @@ class OOBDetector:
 
         # EC span upper bound for the window cap (EC count * raw EB).
         total = len(self.data)
-        raw_eb0 = None
         f2 = self.data.find(UBI_EC_MAGIC, first_ec_off + 1)
-        raw_eb0 = (f2 - first_ec_off) if f2 > 0 else None
+        raw_eb0 = getattr(self, "_raw_eb", None) or \
+            ((f2 - first_ec_off) if f2 > 0 else None)
         span_cap_ebs = None
         if raw_eb0:
             n_ec = self.data.count(UBI_EC_MAGIC)
-            span_cap_ebs = max(self.GEN3_MAX_EB_STEPS,
-                               int((n_ec * raw_eb0) * self.GEN3_MAX_EB_FRACTION / raw_eb0))
+            span_cap_ebs = max(self.GEN3_MAX_EB_STEPS, int(n_ec * self.GEN3_MAX_EB_FRACTION))
 
         fs_magics = [m for m, _, _, _, _ in FS_SCAN_SIGNATURES]
         scored = []
@@ -748,9 +903,29 @@ class OOBDetector:
                      tied[0][1], tied[0][2])
             return tied[0][1], tied[0][2]
 
-        # ratio-equivalent survivors (same structural score) → FF-density delta
-        log.info("Gen3: %d candidates tie at %s — OOB FF-density tie-break",
-                 len(tied), best_score)
+        # ratio-equivalent survivors (same structural score) → VID-alignment
+        # probe FIRST (global, decisive for stride-aliasing cases), then
+        # FF-density as a weaker fallback.
+        vid_scores = []
+        for _score, page_size, oob_size, stride in tied:
+            va = self._vid_alignment_score(first_ec_off, vhf, page_size,
+                                           oob_size, stride)
+            if va is not None:
+                vid_scores.append((va, page_size, oob_size))
+            log.info("Gen3 VID-alignment (page=%d oob=%d): %s",
+                     page_size, oob_size,
+                     "n/a" if va is None else f"{va} aligned hits")
+        if vid_scores:
+            vid_scores.sort(key=lambda t: t[0], reverse=True)
+            best_va = vid_scores[0][0]
+            winners = [v for v in vid_scores if v[0] == best_va]
+            if best_va > 0 and len(winners) == 1:
+                log.info("Gen3: VID-alignment decided page=%d oob=%d "
+                         "(%d aligned hits)", winners[0][1], winners[0][2],
+                         winners[0][0])
+                return winners[0][1], winners[0][2]
+        log.info("Gen3: VID-alignment inconclusive — falling back to FF-density")
+
         ff_scores = []
         for _score, page_size, oob_size, stride in tied:
             ff = self._ff_density_delta(first_ec_off, window_ebs, page_size,
@@ -869,6 +1044,7 @@ class OOBDetector:
         raw_eb = None
         f2 = self.data.find(UBI_EC_MAGIC, first_ec_off + 1)
         raw_eb = (f2 - first_ec_off) if f2 > 0 else 0
+        raw_eb = getattr(self, "_raw_eb", 0) or raw_eb
         if not raw_eb or raw_eb % stride:
             return None
         pages_per_eb = raw_eb // stride
@@ -917,11 +1093,49 @@ class OOBDetector:
             blob.extend(lebs.get(i, b"\xff" * leb_size))
         return self._ubifs_node_crc_rate(bytes(blob), leb_size)
 
+    def _vid_alignment_score(self, first_ec_off: int, vhf: int, page_size: int,
+                             oob_size: int, stride: int,
+                             sample_ebs: int = 64) -> Optional[int]:
+        """Stride-aliasing discriminator: count sampled PEBs whose VID magic
+        lands EXACTLY at the EC-declared vid_hdr_offset AFTER OOB stripping.
+        Ratio-aliased strides (e.g. 1088 vs 2176) keep page-starts aligned so
+        magic bytes still appear somewhere in the stripped stream — but only
+        the TRUE stride preserves the declared intra-page offset. Sampled
+        globally (whole image) so erased areas can't starve the evidence."""
+        try:
+            f2 = self.data.find(UBI_EC_MAGIC, first_ec_off + 1)
+            raw_eb = (f2 - first_ec_off) if f2 > 0 else 0
+            raw_eb = getattr(self, "_raw_eb", 0) or raw_eb
+            if not raw_eb or raw_eb % stride: return None
+            pages = raw_eb // stride
+            hits = misses = 0
+            peb_step = max(1, pages * 8)  # sample every ~8th PEB
+            off = first_ec_off
+            n = 0
+            while off + raw_eb <= len(self.data) and n < sample_ebs:
+                peb = self.data[off: off + raw_eb]
+                off += raw_eb * peb_step; n += 1
+                if peb[:4] != UBI_EC_MAGIC: continue
+                # zero-copy probe: map vhf (clean coords) into raw coords
+                raw_v = (vhf // page_size) * stride + (vhf % page_size)
+                if raw_v + 4 <= len(peb) and peb[raw_v:raw_v+4] == UBI_VID_MAGIC:
+                    hits += 1
+                else:
+                    misses += 1
+            if hits + misses < 8: return None  # insufficient evidence
+            return hits
+        except Exception:
+            return None
+
     def _ff_density_delta(self, first_ec_off: int, window_ebs: int,
-                          page_size: int, oob_size: int, stride: int) -> Optional[float]:
+                          page_size: int, oob_size: int, stride: int,
+                          global_sample: bool = True,
+                          max_written: int = 256) -> Optional[float]:
         """(FF fraction in OOB windows) - (FF fraction in data windows), over
-        WRITTEN raw PEBs of the window. Returns None if no written PEBs found.
-        A PEB counts as written when neither its data nor OOB is all-FF."""
+        WRITTEN raw PEBs. By default samples written PEBs across the WHOLE
+        image (global_sample) — early-flash windows are frequently all-erased
+        (EC-only), which starves the metric exactly when it is needed as a
+        tie-break. Returns None if no written PEBs found."""
         if not oob_size or not page_size:
             return None
         n_eb = 0
@@ -929,15 +1143,20 @@ class OOBDetector:
         n_written = 0
         raw_eb = None
         f2 = self.data.find(UBI_EC_MAGIC, first_ec_off + 1)
-        raw_eb = (f2 - first_ec_off) if f2 > 0 else 0
+        # detect() sets the robust value before any tie-break can fire
+        raw_eb = getattr(self, "_raw_eb", 0) or \
+            ((f2 - first_ec_off) if f2 > 0 else 0)
         if not raw_eb:
             return None
-        while n_eb < window_ebs:
-            peb_base = first_ec_off + n_eb * raw_eb
-            peb = self.data[peb_base: peb_base + raw_eb]
+        limit = len(self.data) if global_sample else \
+            first_ec_off + window_ebs * raw_eb
+        off = first_ec_off
+        while off + raw_eb <= limit:
+            peb = self.data[off: off + raw_eb]
+            off += raw_eb
             n_eb += 1
-            if not peb:
-                break
+            if peb[:4] != UBI_EC_MAGIC:
+                continue
             pages = len(peb) // stride
             p_data_ff = p_oob_ff = 0.0
             n_d = n_o = 0
@@ -955,6 +1174,8 @@ class OOBDetector:
                 continue  # erased PEB (EC-only) — no evidence
             n_written += 1
             oob_ff += p_oob_ff; data_ff += p_data_ff
+            if n_written >= max_written:
+                break
         if not n_written:
             return None
         log.debug("Gen3 FF: page=%d written=%d oob_ff=%.4f data_ff=%.4f",
@@ -1128,12 +1349,13 @@ class VIDHeader:
             return info
         except struct.error: return None
 
-    # Known VID parse layouts for the gen2 consensus scanner (additive).
-    # (name, parser, crc_verify) — tried in order; consensus picks the winner.
+    # Known VID parse layouts (documentation only — the consensus scanner
+    # wasn't shipped; parse() + _verify()'s coverage ladder handle all
+    # currently-known vendor variants).
     LAYOUTS = (
-        ("std64", None),      # legacy parse() — lnum BE32@+12, crc@+60
-        ("linux72", None),    # parse_be72()       — lnum BE32@+12, sqnum@+0x30, crc@+68
-        ("vendor16", None),   # parse_vendor16()   — lnum BE16@+14
+        ("std64", "legacy parse() — lnum BE32@+12, crc@+60"),
+        ("linux72", "parse_be72() — lnum BE32@+12, sqnum@+0x30, crc@+68"),
+        ("vendor16", "parse_vendor16() — lnum BE16@+14"),
     )
 
     @staticmethod
@@ -1187,7 +1409,7 @@ class UBIScanner:
         peb_size = self._determine_peb_size(ec_headers)
         log.info("Scanner: %d EC headers, PEB=0x%X (%d B)", len(ec_headers), peb_size, peb_size)
         regions_raw = self._group_regions(ec_headers, peb_size)
-        log.info("Scanner: %d region group(s) (image_seq/gap grouping)", len(regions_raw))
+        log.info("Scanner: %d region group(s) (attach/gap grouping)", len(regions_raw))
         regions = []
         for i, region_ecs in enumerate(regions_raw):
             log.info("Scanner: region group %d: %d PEBs @0x%X..0x%X",
@@ -1211,29 +1433,88 @@ class UBIScanner:
                     pos = idx + ECHeader.SIZE
                 else: pos = idx + 4
         log.info("EC scan: %d EC header(s) found", len(headers))
-        return headers
+        # Dedupe redundant vendor copies: some images write every EC header
+        # twice a few KiB apart. Downstream PEB-size detection, region
+        # grouping and VID scanning all assume one header per physical PEB.
+        dedup = []
+        for h in headers:
+            if dedup and h.offset - dedup[-1].offset < 0x1000 and \
+               bytes(self.data[h.offset:h.offset + 64]) == \
+               bytes(self.data[dedup[-1].offset:dedup[-1].offset + 64]):
+                continue
+            dedup.append(h)
+        if len(dedup) != len(headers):
+            log.info("EC scan: deduped %d redundant header copy(ies) → %d unique",
+                     len(headers) - len(dedup), len(dedup))
+        return dedup
 
     def _determine_peb_size(self, ec_headers: List[ECHeaderInfo]) -> int:
         if self.forced_peb: return self.forced_peb
-        if len(ec_headers) < 2: return 0x20000
-        gaps, offsets = [], sorted(h.offset for h in ec_headers)
-        for i in range(1, min(len(offsets), 20)):
-            gap = offsets[i] - offsets[i - 1]
-            if gap > 0: gaps.append(gap)
-        return max(set(gaps), key=gaps.count) if gaps else 0x20000
+        if len(ec_headers) < 2:
+            # Single-EC images: fall back to the OOBDetector's evidence-based
+            # raw-EB estimate (shared via _raw_eb) — never a constant.
+            dyn = getattr(self, "_peb_hint", None) or \
+                getattr(getattr(self, "_oob_geom", None), "raw_eb_size", None)
+            if dyn: return dyn
+            raise ValueError(
+                "cannot derive PEB size: only one EC header and no geometry hint")
+        # NOTE: _find_ec_headers already deduped redundant vendor copies —
+        # operate on the unique headers directly.
+        offsets = sorted(h.offset for h in ec_headers)
+        data_off = max(h.data_offset for h in ec_headers)
+        gaps = [b - a for a, b in zip(offsets, offsets[1:]) if b - a > 0]
+        # A valid PEB stride must exceed the data offset (LEB = PEB - data_off
+        # must stay positive) — filters duplicate intervals and stray matches.
+        plausible = [g for g in gaps if g > data_off]
+        # Secondary corroboration: majority of EC headers must sit on the
+        # chosen stride's lattice — guards against stray magic matches.
+        plausible_sorted = sorted(plausible, key=plausible.count, reverse=True)
+        for cand in plausible_sorted[:6]:
+            on_lattice = sum(1 for o in offsets if (o - offsets[0]) % cand == 0)
+            if on_lattice >= len(offsets) * 0.8:
+                log.info("PEB size derived: 0x%X (%d/%d headers on-lattice, "
+                         "%d/8 top gap-freq corroboration)",
+                         cand, on_lattice, len(offsets), plausible.count(cand))
+                return cand
+        if plausible:
+            cand = max(set(plausible), key=plausible.count)
+            log.info("PEB size derived (modal, weak corroboration): 0x%X", cand)
+            return cand
+        # Last resort: geometry-derived hint from the OOB detector stage.
+        hint = getattr(self, "_peb_hint", None) or \
+            getattr(getattr(self, "_oob_geom", None), "raw_eb_size", None)
+        if hint:
+            log.warning("PEB size: no plausible gap > data_offset — using "
+                        "geometry-derived hint 0x%X", hint)
+            return hint
+        raise ValueError("cannot derive PEB size: no plausible gap > data_offset")
 
     def _group_regions(self, ec_headers: List[ECHeaderInfo], peb_size: int) -> List[List[ECHeaderInfo]]:
         if not ec_headers: return []
         sorted_ecs = sorted(ec_headers, key=lambda h: h.offset)
-        regions, current = [], [sorted_ecs[0]]
-        for ec in sorted_ecs[1:]:
-            prev = current[-1]
-            if ec.offset - prev.offset <= peb_size * 4 and ec.image_seq == prev.image_seq:
-                current.append(ec)
-            else:
+        # Split criteria (in priority):
+        #   1. NEW UBI ATTACH — a layout-volume (VTBL, lnum=0) PEB encountered
+        #      after volume data. Multi-attach images (A/B rootfs banks) pack
+        #   attaches contiguously; merging them hides kernel/rootfs volumes.
+        #   2. PHYSICAL GAP > 4 PEBs — erased/damaged span.
+        # NOTE: image_seq is deliberately NOT a split criterion: vendors ship
+        # mixed-seq containers and volumes can span seq populations.
+        vhf_probe = sorted_ecs[0].vid_hdr_offset
+        regions, current, seen_vtbl = [], [], False
+        for ec in sorted_ecs:
+            new_attach = False
+            voff = ec.offset + vhf_probe
+            if voff + VIDHeader.SIZE <= len(self.data):
+                vid = VIDHeader.parse(self.data, voff, 0)
+                if vid and vid.vol_id >= VolumeTable.VTBL_VOL_ID and vid.lnum == 0:
+                    if seen_vtbl:
+                        new_attach = True
+                    seen_vtbl = True
+            if current and (new_attach or ec.offset - current[-1].offset > peb_size * 4):
                 regions.append(current)
-                current = [ec]
-        regions.append(current)
+                current = []
+            current.append(ec)
+        if current: regions.append(current)
         return regions
 
     def _process_region(self, ec_headers: List[ECHeaderInfo], peb_size: int) -> Optional[UBIRegion]:
@@ -1250,6 +1531,12 @@ class UBIScanner:
             start_offset_clean=start_offset, end_offset_clean=end_offset, peb_size_clean=peb_size
         )
         region.vid_headers = self._scan_vid_headers_gen2(ec_headers, vid_hdr_off)
+        # Propagate the observed vid_hdr_offset (probe may have corrected the
+        # EC-declared value) so LEB carving uses the SAME offset that located
+        # the VID headers — otherwise data starts shift by the delta.
+        region.vid_hdr_offset = getattr(self, "_resolved_vid_hdr_offset",
+                                        vid_hdr_off)
+        vid_hdr_off = region.vid_hdr_offset
         log.info("Region: PEB=0x%X LEB=0x%X vhf=0x%X doff=0x%X — %d VID header(s)",
                  peb_size, leb_size, vid_hdr_off, data_off, len(region.vid_headers))
 
@@ -1478,6 +1765,52 @@ class UBIScanner:
                  conv or "unknown", votes if votes else "(no valid EC CRCs)")
         self._crc_convention = conv
 
+        # Vendor-layout probe: some images place VID headers at an offset
+        # other than the EC-declared vid_hdr_offset (e.g. shifted past a
+        # redundant EC copy). Build a DERIVED probe set: multiples/subdivisions
+        # of the observed page stride, the data offset, and the declared
+        # offset ± one page — not hardcoded constants.
+        declared = vid_hdr_off
+        page = getattr(getattr(self, "_oob_geom", None), "page_size", 0) or \
+            min(h.data_offset for h in ec_headers[:8]) or 0x800
+        probes = [declared, 64]  # declared first = priority ordering
+        for base in (page, 2 * page):
+            for k in (-2, -1, 0, 1, 2):
+                probes.append(base + k * 64)
+        probes.extend(d + d // 16 for d in (page, 2 * page))  # stride-shifted
+        # dedupe preserving priority order; keep the declared offset even when
+        # vendors place the VID unusually deep inside the PEB
+        probe_offsets = [p for p in probes if 0 < p <= max(4 * page, declared)]
+        probe_offsets = list(dict.fromkeys(probe_offsets))
+        best_off, best_hits = declared, -1
+        # Sample across the WHOLE PEB population — head PEBs are often
+        # erased (EC-only, bootloader area) which starves the probe.
+        sample_n = min(len(ec_headers), 512)
+        step = max(1, sample_n // 64)
+        # Spread samples across the FIRST HALF of the PEB population — head
+        # PEBs are often erased (bootloader area) which starves the probe,
+        # and tail PEBs may belong to a differently-structured attach.
+        pool = ec_headers[:sample_n]
+        sample = pool[::max(1, len(pool) // 64)]
+        for p in probe_offsets:
+            hits = 0
+            for ec in sample:
+                voff = ec.offset + p
+                if voff + VIDHeader.SIZE > len(self.data): continue
+                if VIDHeader.parse(self.data, voff, 0): hits += 1
+            if hits > best_hits:
+                best_off, best_hits = p, hits
+        if best_hits == 0:
+            log.warning("VID scan: no VID headers at ANY probed offset — "
+                        "keeping declared vid_hdr_offset=0x%X", declared)
+            best_off = declared
+        elif best_off != declared:
+            log.info("VID scan: EC declares vid_hdr_offset=0x%X but VID "
+                     "headers found at +0x%X (%d/%d PEBs) — using observed",
+                     declared, best_off, best_hits, len(sample))
+            vid_hdr_off = best_off
+        self._resolved_vid_hdr_offset = vid_hdr_off
+
         max_sane_lnum = max(8 * len(ec_headers), 64)
         all_vids: List[VIDHeaderInfo] = []
         for i, ec in enumerate(ec_headers):
@@ -1538,6 +1871,8 @@ class UBIScanner:
 
 class Extractor:
     def __init__(self, output_dir: Path, raw_data: bytes, clean_data: bytes, geom: OOBGeometry):
+        self._gate_region = None
+        self._gate_warnings = None
         self.output_dir, self.raw_data, self.clean_data, self.geom = output_dir, raw_data, clean_data, geom
         output_dir.mkdir(parents=True, exist_ok=True)
         (output_dir / "ubi").mkdir(exist_ok=True)
@@ -1545,6 +1880,10 @@ class Extractor:
 
     def extract_region(self, region: UBIRegion, region_idx: int, warnings_list: List[str]) -> None:
         rdir = self.output_dir / "ubi" / f"region_{region_idx}"
+        # v1.12.0: give _extract_filesystem's health gate the region context
+        # (needed to rebuild alternative LEB assemblies when healing).
+        self._gate_region = region
+        self._gate_warnings = warnings_list
         rdir.mkdir(parents=True, exist_ok=True)
         (rdir / "volumes").mkdir(exist_ok=True)
         (rdir / "headers").mkdir(exist_ok=True)
@@ -1777,8 +2116,17 @@ class Extractor:
             vol_bin = vols_dir / f"vol_{vol_id}_{safe_name}.bin"
             vol_bin.write_bytes(clean_vol)
             vol_info.extracted_path = str(vol_bin)
+            vol_info.fs_type = "uImage"
             log.info("Extracted kernel volume %d ('%s') → %s (%d bytes)",
                      vol_id, vol_info.name, vol_bin.name, len(clean_vol))
+            region_ctx = getattr(self, "_gate_region", None)
+            if region_ctx is not None:
+                try:
+                    self._health_gate(vol_id, vol_info, "uImage", region_ctx,
+                                      vol_bin, self._gate_warnings or [])
+                except Exception as e:
+                    log.warning("[FS-CHECK] volume %d: health gate error: %s",
+                                vol_id, e)
 
         elif category == "raw":
             vol_bin = vols_dir / f"vol_{vol_id}_{safe_name}.bin"
@@ -1786,6 +2134,120 @@ class Extractor:
             vol_info.extracted_path = str(vol_bin)
             log.info("Extracted raw volume %d ('%s') → %s (%d bytes)",
                      vol_id, vol_info.name, vol_bin.name, len(clean_vol))
+
+    # ── v1.12.0: post-extraction health gate + anomaly healing ──────────
+    #
+    # "The bytes were written" is not "the filesystem is sound". Every
+    # extracted filesystem is deep-checked; if the structural walk finds
+    # damage, evidence-gated healing candidates are scored and the
+    # healthiest assembly wins. The pre-heal bytes are preserved as
+    # <file>.orig.<ext> and recorded in .heal_report.json so the repack
+    # can emit both the fixed and the anomaly-preserving image.
+    def _heal_candidates(self, vol_id: int, region: UBIRegion) -> List[Tuple[str, bytes]]:
+        """Build alternative assemblies of this volume from the flash image.
+
+        Every candidate is real data from the dump — no invention:
+          - lnum-order (the default assembly the analyst uses)
+          - physical-PEB-order (factory images are written ascending)
+          - per-redundant-copy assemblies + a merged copy, when the
+            volume has more PEBs than its VID headers declare
+        """
+        from ubi_toolkit import fs_health
+        cands: List[Tuple[str, bytes]] = []
+        leb_size = region.leb_size
+
+        # Group this volume's LEB payloads by VID header.
+        entries = [v for v in region.vid_headers if v.vol_id == vol_id]
+        if not entries:
+            return cands
+        max_lnum = max(v.lnum for v in entries)
+
+        def assemble(order: List[int]) -> bytes:
+            buf = bytearray()
+            data_off = region.data_offset
+            for peb in order:
+                eb_start = entries[peb].offset - region.vid_hdr_offset
+                buf += self.clean_data[eb_start + data_off:
+                                       eb_start + data_off + leb_size]
+            return bytes(buf)
+
+        by_lnum: Dict[int, int] = {}
+        dup_lnum = False
+        for i, v in enumerate(entries):
+            if v.lnum in by_lnum:
+                dup_lnum = True
+            by_lnum.setdefault(v.lnum, i)
+        if not dup_lnum:
+            cands.append(("lnum-order", assemble(
+                [by_lnum[l] for l in sorted(by_lnum)])))
+        cands.append(("peb-order", assemble(list(range(len(entries))))))
+        return cands
+
+    def _health_gate(self, vol_id: int, vol_info: VolumeInfo, fs_type: str,
+                     region: UBIRegion, out_path: Path,
+                     warnings_list: List[str]) -> None:
+        """Deep-check an extracted filesystem; heal it if damaged."""
+        from ubi_toolkit import fs_health
+
+        data = out_path.read_bytes()
+        rep = fs_health.check_bytes(data, fs_type)
+        vol_info.deep_health = rep
+        if rep["healthy"]:
+            log.info("[FS-CHECK] volume %d ('%s') %s: healthy (%s)",
+                     vol_id, vol_info.name, fs_type,
+                     "; ".join(f"{k}={v}" for k, v in rep["stats"].items()
+                               if isinstance(v, int)))
+            return
+
+        for e in rep["errors"]:
+            log.warning("[FS-CHECK] volume %d ('%s') %s: %s",
+                        vol_id, vol_info.name, fs_type, e)
+        warnings_list.append(
+            f"volume {vol_id} ('{vol_info.name}') {fs_type} deep check "
+            f"found {len(rep['errors'])} structural issue(s): "
+            + "; ".join(rep["errors"][:3]))
+
+        # ---- heal: try alternative assemblies, keep the healthiest ----
+        candidates = self._heal_candidates(vol_id, region)
+        cands = [("as-extracted", data)] + candidates
+        best_name, best_data, best_rep = fs_health.pick_healthiest(
+            cands, fs_type)
+
+        if best_name != "as-extracted" and \
+                fs_health.score_variant(best_data, fs_type) > \
+                fs_health.score_variant(data, fs_type):
+            orig_path = out_path.with_name(
+                out_path.stem + ".orig" + out_path.suffix)
+            orig_path.write_bytes(data)
+            out_path.write_bytes(best_data)
+            vol_info.deep_health = best_rep
+            vol_info.healed_from = best_name
+            fs_health.record_heal(out_path.parents[1], {
+                "file": out_path.name,
+                "orig_file": orig_path.name,
+                "healed_variant": best_name,
+                "errors_before": len(rep["errors"]),
+                "errors_after": len(best_rep["errors"]),
+                "healthy_after": best_rep["healthy"],
+            })
+            warnings_list.append(
+                f"volume {vol_id} ('{vol_info.name}') healed by alternative "
+                f"assembly '{best_name}' (errors {len(rep['errors'])} -> "
+                f"{len(best_rep['errors'])}); pre-heal bytes kept as "
+                f"{orig_path.name}")
+            log.info("[FS-HEAL] volume %d ('%s'): rebuilt with '%s' "
+                     "(%d -> %d structural errors); original kept as %s",
+                     vol_id, vol_info.name, best_name, len(rep["errors"]),
+                     len(best_rep["errors"]), orig_path.name)
+        else:
+            warnings_list.append(
+                f"volume {vol_id} ('{vol_info.name}') could not be healed "
+                f"by any alternative assembly; best effort kept "
+                f"(still {len(rep['errors'])} structural issue(s))")
+            log.warning("[FS-HEAL] volume %d ('%s'): no alternative "
+                        "assembly is healthier; keeping as-extracted bytes",
+                        vol_id, vol_info.name)
+
 
     def _extract_filesystem(self, clean_vol: bytes, vol_id: int, vol_info: VolumeInfo,
                             safe_name: str, vols_dir: Path) -> None:
@@ -1849,6 +2311,18 @@ class Extractor:
         vol_info.fs_endian = fs_endian
         log.info("Extracted %s volume %d ('%s') → %s (%d bytes)",
                  fs_type, vol_id, vol_info.name, out_path.name, len(fs_data))
+
+        # v1.12.0: every extraction is health-gated; damaged filesystems
+        # trigger evidence-gated healing before anything downstream
+        # (repack/upgrade) ever sees the volume.
+        region = getattr(self, "_gate_region", None)
+        if region is not None:
+            try:
+                self._health_gate(vol_id, vol_info, fs_type, region,
+                                  out_path, self._gate_warnings or [])
+            except Exception as e:  # the gate must never kill extraction
+                log.warning("[FS-CHECK] volume %d: health gate error: %s",
+                            vol_id, e)
 
     def scan_for_orphan_fs(self, regions: List[UBIRegion], warnings_list: List[str]) -> List[FoundFS]:
         found: List[FoundFS] = []
@@ -1966,6 +2440,9 @@ class Extractor:
     def _scan_by_magic(self, data: bytes, is_raw: bool) -> List[dict]:
         results: List[dict] = []
         search_limit = min(len(data), 256 * 1024 * 1024)
+        if search_limit < len(data):
+            log.info("FS magic scan capped at 256 MiB of %d MiB (override: carve.py)",
+                     len(data) // 1048576)
         for magic, fs_type, endian, min_size, desc in FS_SCAN_SIGNATURES:
             pos = 0
             while pos < search_limit:
@@ -2288,22 +2765,27 @@ class FirmwareAnalyst:
             geom = detector.detect()
             clean_data = detector.strip(geom)
 
-        # Runtime self-tests for offset conversions (dynamic — works for any geometry)
+        # Round-trip self-test: clean→raw→clean must be identity for offset
+        # classes that survive mapping (multiples of the page size within a
+        # raw EB keep clean coordinates). Random-ish probes across the image.
         if geom.has_oob:
-            test_raw = 230000
-            test_clean = OOBDetector.raw_to_clean_offset(test_raw, geom)
-            # Compute expected value from first principles: page_index * page_size + min(in_stride, page_size)
-            page_index = test_raw // geom.stride
-            in_stride = test_raw % geom.stride
-            expected_clean = page_index * geom.page_size + min(in_stride, geom.page_size)
-            if test_clean != expected_clean:
-                raise RuntimeError(f"Offset self-test failed: raw {test_raw} -> clean {test_clean} (expected {expected_clean})")
-            test_rt = OOBDetector.clean_to_raw_offset(test_clean, geom)
-            if test_rt != test_raw:
-                raise RuntimeError(f"Offset round-trip failed: clean {test_clean} -> raw {test_rt} (expected {test_raw})")
-            log.info("Offset conversion self-tests passed (page=%d, oob=%d).", geom.page_size, geom.oob_size)
+            probes = [geom.page_size, geom.page_size * 3,
+                      geom.clean_eb_size + geom.page_size,
+                      geom.clean_eb_size * 3 + geom.page_size * 5]
+            for tc in probes:
+                rr = OOBDetector.clean_to_raw_offset(tc, geom)
+                if rr is None:
+                    raise RuntimeError(f"Offset self-test: clean {tc} unmapped")
+                if OOBDetector.raw_to_clean_offset(rr, geom) != tc:
+                    raise RuntimeError(
+                        f"Offset round-trip failed: clean {tc} -> raw {rr} -> "
+                        f"clean {OOBDetector.raw_to_clean_offset(rr, geom)}")
+            log.info("Offset round-trip self-tests passed (page=%d, oob=%d).",
+                     geom.page_size, geom.oob_size)
 
         scanner = UBIScanner(clean_data, self.peb_size, self.leb_size)
+        scanner._oob_geom = geom  # evidence-sharing: PEB fallback derives
+        scanner._peb_hint = geom.raw_eb_size if geom.has_oob else geom.clean_eb_size
         regions = scanner.scan()
 
         report = FirmwareReport(
@@ -2380,10 +2862,13 @@ def main() -> int:
     args = build_parser().parse_args()
     mode = "clean_ubi" if args.clean_ubi else "force_geometry" if args.force_geometry else "auto"
     opts = AnalysisOptions(args.firmware, args.output, mode, args.verbose, args.report_only, args.page_size, args.oob_size, args.peb_size, args.leb_size, args.gui)
-    if opts.gui or not opts.firmware:
-        try:
-            app = GuiApp(); app.root.mainloop(); return 0
-        except Exception: return 1
+    if opts.gui:
+        print("error: GUI mode is not available in this build; use CLI mode "
+              "(ubipack -x -s <firmware> -o <outdir>)", file=sys.stderr)
+        return 2
+    if not opts.firmware:
+        print("error: no firmware specified; use --help for usage", file=sys.stderr)
+        return 2
     return run_with_options(opts)
 
 if __name__ == "__main__":

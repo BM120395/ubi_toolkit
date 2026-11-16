@@ -34,9 +34,10 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional, Tuple
 
-from ubi_toolkit import METADATA_FILENAME, METADATA_SCHEMA_VERSION
+from ubi_toolkit import (METADATA_FILENAME, METADATA_SCHEMA_VERSION,
+                         __version__)
 
 log = logging.getLogger("ubipack")
 
@@ -66,7 +67,7 @@ def write_sidecar(analysis_dir: Path, source: Path, extra: Optional[dict] = None
         "schema_version": METADATA_SCHEMA_VERSION,
         "source_image": str(source.resolve()),
         "source_sha256": _sha256_file(source) if source.exists() else None,
-        "ubipack_version": "1.9.0",
+        "ubipack_version": __version__,
     }
     if extra:
         sidecar.update(extra)
@@ -134,7 +135,9 @@ def op_self_test(_args: argparse.Namespace) -> int:
     # Submodule imports
     try:
         from ubi_toolkit import analyst, repacker, ecc_runtime  # noqa: F401
-        print("  submodules   : OK (analyst, repacker, ecc_runtime)")
+        from ubi_toolkit import carve, fs_health  # noqa: F401  (v1.12.0)
+        print("  submodules   : OK (analyst, repacker, ecc_runtime, "
+              "carve, fs_health)")
     except Exception as e:
         print("  submodules   : FAIL (%s)" % e)
         return 1
@@ -456,8 +459,108 @@ def op_repack(args: argparse.Namespace) -> int:
         argv.append("--verbose")
     repack_args = repack_parser.parse_args(argv)
     log.info("[REPACK] delegating to repacker (analysis=%s)", args.analysis_dir)
-    return repack_main.__wrapped__(repack_args) if hasattr(repack_main, "__wrapped__") \
+    rc = repack_main.__wrapped__(repack_args) if hasattr(repack_main, "__wrapped__") \
         else _call_repack_main(repack_args)
+
+    # ── v1.12.0: dual output ────────────────────────────────────────────
+    # When the analysis tree records healed volumes (the post-extraction
+    # health gate repaired a damaged filesystem), the repack can emit a
+    # SECOND region image built from the PRE-HEAL volume bytes: one
+    # image carries the anomaly-fixed filesystem, the other preserves
+    # the original anomaly exactly as the dump had it.
+    if rc == 0 and getattr(args, "dual_output", False):
+        rc = _repack_original_anomaly(args, repack_parser)
+    elif rc == 0 and not getattr(args, "dual_output", False):
+        from ubi_toolkit import fs_health
+        from pathlib import Path as _P
+        healed = fs_health.load_heal_manifest(_P(args.analysis_dir))
+        if healed:
+            names = ", ".join(r["file"] for r in healed)
+            print(f"[REPACK] note: the analysis tree contains healed "
+                  f"volume(s): {names}. Re-run with --dual-output to also "
+                  f"build a second UBI image that preserves the ORIGINAL "
+                  f"(pre-heal) volume bytes.")
+    return rc
+
+
+def _repack_original_anomaly(args: argparse.Namespace, repack_parser) -> int:
+    """Second repack pass: substitute every healed volume with its
+    pre-heal (.orig) bytes so the output image preserves the original
+    anomaly verbatim. Written under <output>/as-original/ so the
+    primary (fixed) images are never overwritten. User --replace
+    targets win over recorded heals."""
+    from ubi_toolkit import fs_health
+
+    a_dir = Path(args.analysis_dir).expanduser().resolve()
+    out_dir = Path(args.output).expanduser().resolve()
+    orig_dir = out_dir / "as-original"
+    orig_dir.mkdir(parents=True, exist_ok=True)
+
+    # Collect (region_idx, vol_name, orig_path) candidates from:
+    #   1. the heal manifest (health-gate repairs), and
+    #   2. --replace targets whose file has a sibling .orig file.
+    candidates: Dict[Tuple[str, str], Path] = {}
+    for r in fs_health.load_heal_manifest(a_dir):
+        if not r.get("orig_file"):
+            continue
+        orig = Path(r["vols_dir"]) / r["orig_file"]
+        if not orig.exists():
+            continue
+        rdir = Path(r["vols_dir"]).parent.name      # region_N
+        vol_name = r["file"].split("_", 2)[-1].rsplit(".", 1)[0] \
+            if r["file"].startswith("vol_") else r["file"]
+        candidates[(rdir, vol_name)] = orig
+    for spec in (args.replace or []):
+        if "=" not in spec or ":" not in spec:
+            continue
+        region_sel, target = spec.split(":", 1)
+        vol_name, local = target.split("=", 1)
+        p = Path(local).expanduser().resolve()
+        orig = p.with_name(p.stem + ".orig" + p.suffix)
+        if orig.exists() and orig.read_bytes() != p.read_bytes():
+            sel_digits = "".join(c for c in region_sel if c.isdigit())
+            candidates.setdefault((f"region_{sel_digits or '0'}", vol_name),
+                                  orig)
+
+    if not candidates:
+        log.info("[REPACK] dual-output: no pre-heal volumes found; "
+                 "the single image is already both")
+        return 0
+
+    for (region_idx, vol_name), orig in sorted(candidates.items()):
+        argv = ["--analysis-dir", str(a_dir),
+                "--output-dir", str(orig_dir)]
+        # keep the user's replaces for OTHER volumes
+        for spec in (args.replace or []):
+            if ":" not in spec or "=" not in spec:
+                continue
+            sel, target = spec.split(":", 1)
+            sel_digits = "".join(c for c in sel if c.isdigit())
+            if sel_digits == region_idx.split("_")[-1] and \
+                    target.split("=", 1)[0] == vol_name:
+                continue  # this volume comes from the .orig file instead
+            argv += ["--replace", spec]
+        argv += ["--replace", f"region{region_idx.split('_')[-1]}:"
+                              f"{vol_name}={orig}"]
+        if args.yes:
+            argv.append("--yes")
+        if args.peb_size is not None:
+            argv += ["--peb-size", str(args.peb_size)]
+        if args.verbose:
+            argv.append("--verbose")
+        log.info("[REPACK] dual-output: %s volume '%s' from pre-heal "
+                 "bytes %s (original anomaly preserved)",
+                 region_idx, vol_name, orig)
+        repack_args = repack_parser.parse_args(argv)
+        rc2 = _call_repack_main(repack_args)
+        if rc2 != 0:
+            log.error("[REPACK] dual-output second pass failed for %s "
+                      "(rc=%d); primary images are unaffected",
+                      region_idx, rc2)
+            return rc2
+    print(f"[REPACK] dual-output OK: anomaly-preserving image(s) under "
+          f"{orig_dir}")
+    return 0
 
 
 def _call_repack_main(repack_args) -> int:
@@ -613,8 +716,246 @@ def op_verify(args: argparse.Namespace) -> int:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Splice (v1.11.0): write repacked regions back into the interleaved dump
+# ═══════════════════════════════════════════════════════════════════════════
+
+def op_splice(args: argparse.Namespace) -> int:
+    """Splice repacked clean region images into the ORIGINAL interleaved dump.
+
+    The layout is re-derived from the dump itself (same anomaly scan the
+    analyze path runs), cross-checked against the analysis directory the
+    repack was built on, then FS slices of changed pages are replaced and
+    non-FS (ECC/aux) slices are carried over verbatim."""
+    from ubi_toolkit import splice as splice_mod
+    from ubi_toolkit.anomaly import scan_anomalies
+
+    dump_path = Path(args.firmware).expanduser().resolve()
+    if not dump_path.exists():
+        print(f"error: dump not found: {dump_path}", file=sys.stderr)
+        return 2
+    a_dir = Path(args.analysis_dir).expanduser().resolve()
+    if not a_dir.is_dir():
+        print(f"error: analysis directory not found: {a_dir}", file=sys.stderr)
+        return 2
+    repacked_root = Path(args.repacked).expanduser().resolve() \
+        if args.repacked else a_dir
+    out_path = (Path(args.output).expanduser().resolve()
+                if args.output and args.output != "output"
+                else dump_path.with_name(dump_path.stem + ".spliced.bin"))
+
+    # 1) Re-derive the page layout from the dump (source of truth).
+    print(f"[SPLICE] scanning dump for UBI geometry + page layout "
+          f"({dump_path.name})...")
+    ctx = scan_anomalies(dump_path.read_bytes(), verbose=args.verbose)
+    if ctx.ubi_base is None or ctx.peb_stride is None \
+            or ctx.page_stride is None or not ctx.page_layout:
+        print("[SPLICE] ERROR: no UBI region / page layout could be "
+              "adjudicated from this dump — nothing to splice",
+              file=sys.stderr)
+        return 3
+    _lname, _pdata, slices, _gp, _gs = ctx.page_layout
+    ps: int = ctx.page_stride
+    peb_stride: int = ctx.peb_stride
+    pp_peb = ctx.pages_per_peb or (peb_stride // ps)
+    print(f"[SPLICE] layout '{_lname}' page={ps}B fs/page="
+          f"{splice_mod.fs_per_page(slices)}B, regions: "
+          f"{splice_mod.cluster_ec_offsets(ctx.ec_offsets, ctx.peb_stride)}")
+
+    # 2) Discover repacked region images (CLI arg wins; else -o of the repack).
+    by_region: "dict[int, Path]" = {}
+    for cand in sorted(repacked_root.rglob(f"*{splice_mod.REPACKED_SUFFIX}")):
+        parts = cand.relative_to(repacked_root).parts
+        for part in parts:
+            if part.startswith("region_"):
+                try:
+                    by_region[int(part.split("_", 1)[1])] = cand
+                except ValueError:
+                    pass
+    if not by_region:
+        print(f"[SPLICE] ERROR: no *_ubi_repacked.img found under "
+              f"{repacked_root} (expected <...>/region_N/<...>_ubi_repacked."
+              f"img)", file=sys.stderr)
+        return 2
+
+    # 3) Cross-check against the analysis the repack was built on.
+    a_ubi = a_dir / "ubi"
+    if a_ubi.is_dir():
+        a_regions = sorted(p for p in a_ubi.glob("region_*") if p.is_dir())
+    else:
+        a_regions = []
+    if not a_regions:
+        print(f"[SPLICE] WARN: analysis dir has no ubi/region_* subdirs "
+              f"({a_dir}) — region-count cross-check skipped")
+        a_region_count = None
+    else:
+        a_region_count = len(a_regions)
+        if a_region_count != len(by_region):
+            print(f"[SPLICE] ERROR: analysis has {a_region_count} region(s) "
+                  f"but {len(by_region)} repacked image(s) found — refusing "
+                  f"partial splice", file=sys.stderr)
+            return 3
+
+    dump = dump_path.read_bytes()
+    orders = sorted(by_region)
+    report_all = []
+    out = bytearray(dump)
+    any_change = False
+    for ri in orders:
+        repacked_path = by_region[ri]
+        repacked = repacked_path.read_bytes()
+        # Region base: Nth contiguous EC run (dump order), sanity-checked
+        # against the analysis's clean_ubi.img size.
+        runs = splice_mod.cluster_ec_offsets(ctx.ec_offsets, peb_stride)
+        if ri >= len(runs):
+            print(f"[SPLICE] ERROR: repacked region{ri} has no matching EC "
+                  f"run in the dump", file=sys.stderr)
+            return 3
+        base, peb_count = runs[ri]
+        # Cross-check PEB count against the analysis image. The analysis's
+        # clean_ubi.img is DEINTERLEAVED (its PEB = pages_per_peb * fs/page),
+        # not stride-sized like the dump region.
+        clean = a_dir / "ubi" / f"region_{ri}" / "clean_ubi.img"
+        clean_peb = pp_peb * splice_mod.fs_per_page(slices)
+        if clean.exists() and clean.stat().st_size != peb_count * clean_peb:
+            print(f"[SPLICE] ERROR: region{ri}: dump run has {peb_count} "
+                  f"PEBs but analysis clean_ubi.img implies "
+                  f"{clean.stat().st_size // clean_peb} — "
+                  f"analysis/dump mismatch", file=sys.stderr)
+            return 3
+        plan = splice_mod.plan_region(dump, repacked, base, ps, pp_peb,
+                                      slices, f"region_{ri}")
+        print(f"[SPLICE] region_{ri} @ {base:#x}: {plan.pages_changed}/"
+              f"{plan.pages} pages differ ({plan.pebs_changed} PEBs, "
+              f"range {plan.first_peb}..{plan.last_peb})")
+        if plan.pages_changed:
+            new, report = splice_mod.splice_bytes(dump, [repacked], [base],
+                                                  ps, pp_peb, slices)
+            errs = splice_mod.verify_splice(new, dump, repacked, base, ps,
+                                            pp_peb, slices)
+            if errs:
+                for e in errs[:10]:
+                    print(f"[SPLICE] VERIFY: {e}", file=sys.stderr)
+                print(f"[SPLICE] FAILED — {len(errs)} verification "
+                      f"violation(s); nothing written", file=sys.stderr)
+                return 4
+            drift = splice_mod.verify_no_aux_drift(new, dump, base, ps,
+                                                   pp_peb, slices)
+            if drift:
+                print(f"[SPLICE] VERIFY: aux drift on {drift} pages",
+                      file=sys.stderr)
+                return 4
+            out = bytearray(new)
+            dump = bytes(out)
+            any_change = True
+            report.source = str(dump_path)
+            report.output = str(out_path)
+            report.layout_name = _lname
+            report_all.append(report)
+        else:
+            print(f"[SPLICE] region_{ri}: FS content identical — nothing to "
+                  f"splice")
+
+    if not any_change:
+        print("[SPLICE] all regions identical to the repacked source — "
+              "nothing written")
+        return 0
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_bytes(bytes(out))
+    print(f"[SPLICE] wrote {out_path} ({len(out):,} bytes)")
+    for report in report_all:
+        print(report.summary())
+    return 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Argument parser
 # ═══════════════════════════════════════════════════════════════════════════
+
+def op_carve(args: argparse.Namespace) -> int:
+    """--carve (v1.12.0): raw NAND/UBI flash dump -> SquashFS volume.
+
+    The dump is not treated as an image: interleaved NAND OOB/spare
+    bytes are stripped, the UBI partition is located and walked, the
+    volume table is decoded, and the target volume is rebuilt in LEB
+    order and trimmed to the exact SquashFS size. Anomalies found on
+    the way (real wear, bit-flipped headers, redundant image copies,
+    erased blocks) are detected and reported -- they shape how the
+    volume is rebuilt, and none of them abort the run unless nothing
+    usable can be carved at all. The carved volume is then validated
+    with the toolkit's own FsValidator; no external squashfs tool is
+    needed.
+    """
+    from ubi_toolkit import carve as carve_mod
+    from ubi_toolkit.analyst import FsValidator
+
+    if not args.firmware:
+        print("error: -s/--source required for carve", file=sys.stderr)
+        return 2
+    fw = Path(args.firmware).expanduser().resolve()
+    if not fw.exists():
+        print(f"error: firmware not found: {fw}", file=sys.stderr)
+        return 2
+
+    out_dir = Path(args.output).expanduser().resolve() \
+        if args.output != "output" else fw.parent / (fw.stem + "_carve")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / "carved.squashfs"
+
+    print(f"[CARVE] reading {fw} ...")
+    raw = fw.read_bytes()
+    print(f"[CARVE] {len(raw):,} bytes")
+
+    try:
+        rep = carve_mod.carve(
+            raw, out_path,
+            volume=getattr(args, "volume", None),
+            page_size=getattr(args, "page_size", None),
+            oob_size=getattr(args, "oob_size", None),
+            peb_size=getattr(args, "peb_size", None),
+        )
+    except carve_mod.CarveError as e:
+        print(f"[CARVE] ERROR: {e}", file=sys.stderr)
+        return 1
+
+    geom = rep["geometry"]
+    print(f"[CARVE] geometry : page={geom['page_size']} "
+          f"oob={geom['oob_size']} PEB={geom['peb_size']} "
+          f"(UBI at {geom['ubi_start']:#x}, {geom['ubi_pebs']} PEBs)")
+    print(f"[CARVE] volumes  : " + (", ".join(
+        f"{v['name']!r}(id={v['vol_id']}, {v['lebs_found']} LEBs"
+        + (f", {v['copies']} copies" if v.get("copies", 0) > 1 else "")
+        + ")" for v in rep["volumes"]) or "none"))
+    print(f"[CARVE] target   : {rep['target_name']!r} "
+          f"(vol_id {rep['target_vol_id']})")
+    sb = rep["superblock"]
+    if sb:
+        print(f"[CARVE] squashfs : v{sb['s_major']}.{sb['s_minor']} "
+              f"{sb['compression_name']}, {sb['inode_count']} inodes, "
+              f"bytes_used={sb['bytes_used']:,}")
+        print(f"[CARVE] carved   : {rep['carved_size']:,} B "
+              f"(raw volume {rep['raw_volume_size']:,} B) -> {out_path}")
+    else:
+        print(f"[CARVE] carved   : {rep['carved_size']:,} B "
+              f"(no SquashFS superblock -- raw volume kept)")
+    if rep["anomalies"]:
+        print(f"[CARVE] anomalies: {len(rep['anomalies'])}")
+        for a in rep["anomalies"]:
+            print(f"  - {a}")
+
+    # ---- validate the carved image with the toolkit's own validator ----
+    vol_bytes = Path(out_path).read_bytes()
+    if rep["superblock"]:
+        validation = FsValidator.validate("SquashFS", vol_bytes)
+        if validation.get("valid"):
+            print(f"[CARVE] validation: OK ({len(vol_bytes):,} B squashfs)")
+        else:
+            print(f"[CARVE] validation: FAILED ({validation.get('reason', 'unknown')})",
+                  file=sys.stderr)
+            return 1
+    print(f"[CARVE] OK: volume written to {out_path} "
+          f"(raw copy at {rep['raw_volume_path']})")
+    return 0
+
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
@@ -661,6 +1002,10 @@ Examples:
   # Same, plus verbatim donor restore when volumes differ beyond bit rot
   ubipack -a analyze -s dump.bin -o out/ --auto-fix \
       --reference donor_volume.squashfs --restore-reference
+
+  # Write the repacked regions back into the ORIGINAL interleaved dump
+  # (page-faithful: only FS slices change; ECC/aux bytes carried verbatim)
+  ubipack --splice -s dump.bin -n out/ --repacked repacked/ -o dump.spliced.bin
 """)
     mode = p.add_mutually_exclusive_group(required=True)
     mode.add_argument("-a", "--analyze", dest="op_analyze", action="store_true",
@@ -675,6 +1020,25 @@ Examples:
                       help="Re-audit an analysis directory (VID CRC + EC magic/CRC)")
     mode.add_argument("-t", "--self-test", dest="op_self_test", action="store_true",
                       help="Verify toolchain availability and import sanity")
+
+    # Splice (v1.11.0): write repacked regions back into the source dump
+    mode.add_argument("--splice", dest="op_splice", action="store_true",
+                      help="Splice previously repacked regions back into the "
+                           "ORIGINAL interleaved dump (page-faithful: only FS "
+                           "slices change; ECC/aux bytes carried verbatim). "
+                           "Dump via -s, repacked tree via --repacked (or -n); "
+                           "output via -o")
+
+    # Carve (v1.12.0): raw NAND/UBI dump -> SquashFS volume
+    mode.add_argument("--carve", dest="op_carve", action="store_true",
+                      help="Treat -s IMAGE as a RAW NAND/UBI flash dump: "
+                           "strip interleaved OOB/spare bytes, locate the "
+                           "UBI partition, decode the volume table, rebuild "
+                           "the target volume in LEB order and trim it to "
+                           "the exact SquashFS size. Anomalies (wear, "
+                           "bit-flips, redundant copies, gaps) are detected "
+                           "and reported, never silently ignored. Output "
+                           "via -o; volume via --volume")
 
     # Lifecycle (v1.6.0): self-managed install/uninstall/upgrade/clean
     mode.add_argument("-I", "--install", dest="op_install", action="store_true",
@@ -699,8 +1063,13 @@ Examples:
                         "(repack: where repacked images are written)")
     p.add_argument("-n", "--analysis-dir", dest="analysis_dir",
                    help="Existing ubipack ANALYSIS directory (for repack/"
-                        "verify): the one containing ubi/region_N/"
+                        "verify/splice): the one containing ubi/region_N/"
                         "clean_ubi.img — NOT the repack output directory")
+    p.add_argument("--repacked", dest="repacked", metavar="DIR",
+                   help="Splice: directory holding the repack output "
+                        "(<...>/region_N/*_ubi_repacked.img); default: the "
+                        "repack output you passed with -o, i.e. search from "
+                        "-n if unset")
 
     # Geometry (forwarded to analyst)
     p.add_argument("--page-size", type=lambda x: int(x, 0),
@@ -742,6 +1111,15 @@ Examples:
     p.add_argument("--replace", action="append",
                    metavar="regionN:volume=FILE",
                    help="Repack: replacement target (repeat for multi-volume)")
+    p.add_argument("--volume", dest="volume", metavar="NAME",
+                   help="Carve: volume name to extract (default: the first "
+                        "volume whose LEB 0 starts with a SquashFS magic)")
+    p.add_argument("--dual-output", dest="dual_output", action="store_true",
+                   help="Repack: also build a second UBI image from the "
+                        "PRE-HEAL volume bytes recorded by the post-"
+                        "extraction health gate, so you get one image with "
+                        "the anomaly FIXED and one preserving the ORIGINAL "
+                        "anomaly verbatim")
     p.add_argument("--dry-run", action="store_true",
                    help="Repack: preflight only, write nothing")
     p.add_argument("--yes", action="store_true",
@@ -767,7 +1145,7 @@ Examples:
     p.add_argument("-v", "--verbose", action="store_true",
                    help="Enable DEBUG logging")
     p.add_argument("--version", action="version",
-                   version="ubipack 1.10.1")
+                   version="ubipack 1.12.0")
     return p
 
 
@@ -808,6 +1186,10 @@ def main() -> int:
                 return op_extract(args)
             if args.op_repack:
                 return op_repack(args)
+            if getattr(args, "op_splice", False):
+                return op_splice(args)
+            if getattr(args, "op_carve", False):
+                return op_carve(args)
             if args.op_compare:
                 return op_compare(args)
             if args.op_verify:

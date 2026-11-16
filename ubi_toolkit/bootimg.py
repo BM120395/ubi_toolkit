@@ -116,15 +116,30 @@ def extract_all(view: bytes, out_dir, layout_name: str = "identity",
             dcrc_ok = c == u["dcrc"] or (c ^ 0xFFFFFFFF) == u["dcrc"]
         fname = f"{_safe_name(u['name'], idx)}.uimage.bin"
         (out_dir / fname).write_bytes(payload)
+        # v1.12.0: deep-check the extracted uImage (header + payload CRC)
+        # via the fs_health gate so boot images get the same scrutiny as
+        # filesystem volumes.
+        try:
+            from ubi_toolkit import fs_health
+            hrep = fs_health.deep_check_uimage(
+                view[off:off + UIMAGE_HDR + size])
+            health = "OK" if hrep["healthy"] else \
+                f"ISSUES: {'; '.join(hrep['errors'][:2])}"
+        except Exception as e:
+            hrep = None
+            health = f"check-error: {e}"
         entry = dict(file=fname, kind="uimage", name=u["name"],
                      itype=u["itype"], comp=u["comp"], load=u["load"],
                      ep=u["ep"], offset_in_view=hex(off), size=size,
                      data_crc_ok=dcrc_ok,
+                     health_check=(hrep or {}).get("healthy"),
+                     health_errors=(hrep or {}).get("errors", []),
                      sha256=hashlib.sha256(payload).hexdigest())
         manifest.append(entry)
         log(f"[BOOT-IMG] uimage '{u['name']}' type={u['itype']} "
             f"comp={u['comp']} size={size:,} @{off:#x} "
-            f"payload_crc={'OK' if dcrc_ok else 'MISMATCH'} -> {fname}")
+            f"payload_crc={'OK' if dcrc_ok else 'MISMATCH'} "
+            f"health={health} -> {fname}")
         idx += 1
     for f in find_fits(view):
         blob = view[f["offset"]:f["offset"] + f["size"]]
